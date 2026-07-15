@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
 from .data_provider import DataProvider
 from .data_quality import validate_warehouse
 from .historical_store import HistoricalStore
+from .models import SecurityType
 from .repository import Repository
 from .sync_service import SyncProgress, SyncService
 from .time_utils import beijing_today
@@ -51,6 +53,7 @@ class DataManagementPage(QWidget):
         self.thread_pool = thread_pool
         self.sync_service = SyncService(store, provider)
         self._worker: Worker | None = None
+        self._export_worker: Worker | None = None
         self._job_id: int | None = None
         self.sync_progress.connect(self._progress)
         self._build_ui()
@@ -152,14 +155,36 @@ class DataManagementPage(QWidget):
     def _export(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        controls = QHBoxLayout()
+        scope_panel = QFrame()
+        scope_panel.setObjectName("Section")
+        scope_layout = QGridLayout(scope_panel)
+        scope_title = QLabel("1　选择导出数据")
+        scope_title.setObjectName("AppName")
         self.export_scope = QComboBox()
         self.export_scope.addItem("全部本地证券", "all")
+        self.export_scope.addItem("全部本地A股", "stocks")
+        self.export_scope.addItem("全部本地ETF", "etfs")
         self.export_scope.addItem("当前自选", "watchlist")
         self.export_adjustment = QComboBox()
         self.export_adjustment.addItem("前复权", "qfq")
         self.export_adjustment.addItem("不复权", "")
         self.export_adjustment.addItem("后复权", "hfq")
+        self.export_format = QComboBox()
+        self.export_format.addItem("CSV 长表（UTF-8 BOM，Excel可直接打开）", "csv")
+        scope_layout.addWidget(scope_title, 0, 0, 1, 6)
+        scope_layout.addWidget(QLabel("证券范围"), 1, 0)
+        scope_layout.addWidget(self.export_scope, 1, 1)
+        scope_layout.addWidget(QLabel("价格口径"), 1, 2)
+        scope_layout.addWidget(self.export_adjustment, 1, 3)
+        scope_layout.addWidget(QLabel("文件格式"), 1, 4)
+        scope_layout.addWidget(self.export_format, 1, 5)
+        layout.addWidget(scope_panel)
+
+        date_panel = QFrame()
+        date_panel.setObjectName("Section")
+        date_layout = QGridLayout(date_panel)
+        date_title = QLabel("2　设置交易日期")
+        date_title.setObjectName("AppName")
         today = beijing_today()
         qtoday = QDate(today.year, today.month, today.day)
         self.export_start = QDateEdit(QDate(1990, 1, 1))
@@ -169,25 +194,74 @@ class DataManagementPage(QWidget):
         self.export_end.setCalendarPopup(True)
         self.export_end.setDisplayFormat("yyyy-MM-dd")
         self.export_end.setMaximumDate(qtoday)
-        button = QPushButton("导出CSV…")
-        button.setObjectName("Primary")
-        button.clicked.connect(self._export_csv)
-        for label, widget in (
-            ("范围", self.export_scope),
-            ("复权", self.export_adjustment),
-            ("开始", self.export_start),
-            ("结束", self.export_end),
+        date_layout.addWidget(date_title, 0, 0, 1, 8)
+        date_layout.addWidget(QLabel("开始"), 1, 0)
+        date_layout.addWidget(self.export_start, 1, 1)
+        date_layout.addWidget(QLabel("结束"), 1, 2)
+        date_layout.addWidget(self.export_end, 1, 3)
+        for column, (label, years) in enumerate(
+            (("近1年", 1), ("近3年", 3), ("近5年", 5), ("全部历史", 0)), start=4
         ):
-            controls.addWidget(QLabel(label))
-            controls.addWidget(widget)
-        controls.addStretch(1)
-        controls.addWidget(button)
-        layout.addLayout(controls)
-        self.export_status = QLabel("按证券逐批读取和写入，不构建全市场内存宽表。")
+            preset = QPushButton(label)
+            preset.clicked.connect(
+                lambda checked=False, value=years: self._set_export_range(value)
+            )
+            date_layout.addWidget(preset, 1, column)
+        layout.addWidget(date_panel)
+
+        output_panel = QFrame()
+        output_panel.setObjectName("Section")
+        output_layout = QGridLayout(output_panel)
+        output_title = QLabel("3　选择文件并导出")
+        output_title.setObjectName("AppName")
+        self.export_path = QLineEdit(str(Path.home() / "A股历史数据.csv"))
+        self.export_path.setReadOnly(True)
+        browse = QPushButton("选择保存位置…")
+        browse.clicked.connect(self._choose_export_path)
+        self.export_button = QPushButton("开始流式导出")
+        self.export_button.setObjectName("Primary")
+        self.export_button.clicked.connect(self._export_csv)
+        output_layout.addWidget(output_title, 0, 0, 1, 4)
+        output_layout.addWidget(self.export_path, 1, 0, 1, 2)
+        output_layout.addWidget(browse, 1, 2)
+        output_layout.addWidget(self.export_button, 1, 3)
+        layout.addWidget(output_panel)
+        self.export_progress = QProgressBar()
+        self.export_progress.setRange(0, 0)
+        self.export_progress.hide()
+        layout.addWidget(self.export_progress)
+        self.export_status = QLabel(
+            "采用证券逐批读取与写入，不构建全市场内存宽表；输出包含代码、名称、类型、市场、交易日、复权口径和全部日线字段。"
+        )
         self.export_status.setObjectName("Muted")
+        self.export_status.setWordWrap(True)
         layout.addWidget(self.export_status)
+        tip = QLabel(
+            "建议：先在“数据同步”确认所需复权口径和日期已入库，再导出；导出过程只读数据库，不会修改或删除现有数据。"
+        )
+        tip.setObjectName("Tiny")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
         layout.addStretch(1)
         return page
+
+    def _set_export_range(self, years: int) -> None:
+        end = self.export_end.date()
+        self.export_start.setDate(QDate(1990, 1, 1) if years == 0 else end.addYears(-years))
+
+    def _choose_export_path(self) -> bool:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出本地历史数据",
+            self.export_path.text() or str(Path.home() / "A股历史数据.csv"),
+            "CSV 文件 (*.csv)",
+        )
+        if not path:
+            return False
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        self.export_path.setText(path)
+        return True
 
     def _quality(self) -> QWidget:
         page = QWidget()
@@ -295,20 +369,34 @@ class DataManagementPage(QWidget):
         )
 
     def _export_csv(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "导出本地历史数据",
-            str(Path.home() / "A股历史数据.csv"),
-            "CSV 文件 (*.csv)",
-        )
-        if not path:
+        if self._export_worker is not None:
             return
-        securities = (
-            self.repository.list_watchlist()
-            if self.export_scope.currentData() == "watchlist"
-            else None
-        )
-        worker = Worker(
+        path = self.export_path.text().strip()
+        if not path:
+            if not self._choose_export_path():
+                return
+            path = self.export_path.text().strip()
+        scope = str(self.export_scope.currentData())
+        if scope == "watchlist":
+            securities = self.repository.list_watchlist()
+        elif scope == "stocks":
+            securities = [
+                item
+                for item in self.store.list_securities()
+                if item.security_type is SecurityType.STOCK
+            ]
+        elif scope == "etfs":
+            securities = [
+                item
+                for item in self.store.list_securities()
+                if item.security_type is SecurityType.ETF
+            ]
+        else:
+            securities = None
+        self.export_button.setEnabled(False)
+        self.export_progress.show()
+        self.export_status.setText("正在按证券流式导出，请勿关闭程序……")
+        self._export_worker = Worker(
             self.store.export_csv,
             Path(path),
             securities,
@@ -316,13 +404,19 @@ class DataManagementPage(QWidget):
             self.export_start.date().toString("yyyy-MM-dd"),
             self.export_end.date().toString("yyyy-MM-dd"),
         )
-        worker.signals.result.connect(
+        self._export_worker.signals.result.connect(
             lambda count: self.export_status.setText(f"导出完成：{count:,} 行 · {path}")
         )
-        worker.signals.error.connect(
+        self._export_worker.signals.error.connect(
             lambda message: self.export_status.setText(f"导出失败：{message}")
         )
-        self.thread_pool.start(worker)
+        self._export_worker.signals.finished.connect(self._finish_export)
+        self.thread_pool.start(self._export_worker)
+
+    def _finish_export(self) -> None:
+        self._export_worker = None
+        self.export_button.setEnabled(True)
+        self.export_progress.hide()
 
     def _validate(self) -> None:
         worker = Worker(validate_warehouse, self.store)

@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .data_provider import DataProvider
+from .factor_models import model_backtest_template
 from .historical_store import HistoricalStore
 from .models import Security, SecurityType
 from .portfolio_backtest import (
@@ -32,6 +33,7 @@ from .portfolio_backtest import (
     PortfolioBacktestResult,
 )
 from .repository import Repository
+from .quant_page import QuantWorkspacePage
 from .time_utils import beijing_today
 from .ui_common import Worker, configure_table, section_title
 
@@ -58,9 +60,15 @@ class StrategyBacktestPage(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 14, 18, 14)
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._quant_placeholder(), "量化")
+        self.quant_workspace = QuantWorkspacePage(
+            repository, provider, self.historical_store, thread_pool
+        )
+        self.quant_workspace.model_requested.connect(self._load_factor_model)
+        self.tabs.addTab(self.quant_workspace, "量化")
         self.tabs.addTab(self._backtest_page(), "回测")
-        self.tabs.addTab(custom_indicator_page or self._indicator_placeholder(), "指标")
+        self.tabs.addTab(
+            custom_indicator_page or self._indicator_placeholder(), "自定义指标"
+        )
         root.addWidget(self.tabs)
 
     @staticmethod
@@ -335,6 +343,22 @@ class StrategyBacktestPage(QWidget):
         self.entry.setText(entry)
         self.exit.setText(exit_formula)
         self.score.setText(score)
+
+    def _load_factor_model(self, model_key: str) -> None:
+        try:
+            name, entry, exit_formula, score = model_backtest_template(model_key)
+        except (KeyError, ValueError) as exc:
+            self.status.setText(str(exc))
+            return
+        self.template.setCurrentIndex(-1)
+        self.strategy_name.setText(f"{name}回测")
+        self.entry.setText(entry)
+        self.exit.setText(exit_formula)
+        self.score.setText(score)
+        self.status.setText(
+            f"已从量化因子模型库载入“{name}”；可调整范围、成本和持仓参数后开始回测。"
+        )
+        self.tabs.setCurrentIndex(1)
 
     def _config(self) -> PortfolioBacktestConfig:
         return PortfolioBacktestConfig(

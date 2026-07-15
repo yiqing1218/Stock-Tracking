@@ -68,7 +68,7 @@ class MainWindow(QMainWindow):
             ("screener", "条件荐股"),
             ("watchlist", "自选股票"),
             ("detail", "股票详情"),
-            ("strategy", "量化策略/回测/指标"),
+            ("strategy", "量化策略/回测/自定义指标"),
             ("alerts", "消息提示"),
             ("data", "数据导出"),
         ):
