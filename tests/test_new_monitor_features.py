@@ -90,7 +90,9 @@ def test_custom_indicator_category_library_and_favorite_persist(tmp_path) -> Non
     )
     repository.set_indicator_favorite(f"custom:{saved.id}", True)
 
-    loaded = next(item for item in repository.list_custom_indicators() if item.id == saved.id)
+    loaded = next(
+        item for item in repository.list_custom_indicators() if item.id == saved.id
+    )
     assert loaded.category == "量能"
     assert loaded.in_library is True
     assert f"custom:{saved.id}" in repository.list_indicator_favorites()
@@ -152,23 +154,34 @@ def test_overview_has_period_controls_and_six_rows_without_scrollbars(tmp_path) 
     page.snapshots = build_indicator_snapshot(page.indicator_frame)
     page._update_overview()
 
-    assert set(page.period_buttons) == {"daily", "weekly", "monthly"}
+    assert set(page.period_buttons) == {"daily", "weekly", "yearly"}
     assert not hasattr(page, "chip_distribution_chart")
     assert page.signal_table.rowCount() == 6
-    assert page.signal_table.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert (
+        page.signal_table.verticalScrollBarPolicy()
+        == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
     app.processEvents()
 
 
-def test_fund_and_chip_sources_fall_back_to_local_models(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_fund_flow_can_be_estimated_but_chips_are_never_fabricated(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
     provider = DataProvider(tmp_path / "cache")
     security = Security("600000", "浦发银行", SecurityType.STOCK, "sh")
 
     def unavailable(*_args, **_kwargs):  # type: ignore[no-untyped-def]
         raise RuntimeError("offline")
 
-    monkeypatch.setattr("astock_monitor.data_provider.ak.stock_individual_fund_flow", unavailable)
-    monkeypatch.setattr("astock_monitor.data_provider.ak.stock_individual_fund_flow_rank", unavailable)
-    monkeypatch.setattr("astock_monitor.data_provider.ak.stock_fund_flow_individual", unavailable)
+    monkeypatch.setattr(
+        "astock_monitor.data_provider.ak.stock_individual_fund_flow", unavailable
+    )
+    monkeypatch.setattr(
+        "astock_monitor.data_provider.ak.stock_individual_fund_flow_rank", unavailable
+    )
+    monkeypatch.setattr(
+        "astock_monitor.data_provider.ak.stock_fund_flow_individual", unavailable
+    )
     monkeypatch.setattr("astock_monitor.data_provider.ak.stock_cyq_em", unavailable)
 
     flow = provider._load_fund_flow(security, sample_history())
@@ -176,8 +189,8 @@ def test_fund_and_chip_sources_fall_back_to_local_models(tmp_path, monkeypatch) 
 
     assert not flow.empty
     assert flow.attrs["source"] == "本地OHLCV资金流估算（非逐笔主力）"
-    assert not chips.empty
-    assert chips.attrs["source"] == "本地换手衰减成本模型估算"
+    assert chips.empty
+    assert chips.attrs["source"] == "东方财富筹码接口无可靠返回"
 
 
 def test_watchlist_numeric_sort_keeps_security_mapping_and_score(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -236,7 +249,9 @@ def test_classic_indicators_have_more_score_weight_and_detailed_text() -> None:
     assert len(description) > 80
 
 
-def test_detail_first_paint_does_not_expand_hundreds_of_indicators(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_detail_first_paint_does_not_expand_hundreds_of_indicators(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
     provider = DataProvider(tmp_path / "cache")
     repository = Repository(tmp_path / "monitor.db")
     page = DetailPage(repository, provider, QThreadPool())
@@ -254,7 +269,9 @@ def test_detail_first_paint_does_not_expand_hundreds_of_indicators(tmp_path, mon
     assert len(frame.columns) < 150
 
 
-def test_market_dashboard_calculates_breadth_and_leading_sector(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_market_dashboard_calculates_breadth_and_leading_sector(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
     provider = DataProvider(tmp_path / "cache")
     spot = pd.DataFrame(
         {

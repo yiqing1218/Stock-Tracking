@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 astock-monitor = "astock_monitor.app:main"
+astock-sync = "astock_monitor.sync_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

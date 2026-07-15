@@ -52,6 +52,7 @@ class MarketChart(QWidget):
         self._last_plot_rect = QRectF()
         self._visible_frame = pd.DataFrame()
         self._event_markers = pd.DataFrame()
+        self._overlay_columns = ["SMA_5", "SMA_20", "BB_UPPER", "BB_LOWER"]
 
     def sizeHint(self) -> QSize:
         return QSize(900, 600)
@@ -81,7 +82,6 @@ class MarketChart(QWidget):
         )
         self._visible_count = min(max(40, self._visible_count), max(40, len(frame)))
         self._right_offset = 0
-        self._event_markers = pd.DataFrame()
         self.update()
 
     def clear(self) -> None:
@@ -91,6 +91,10 @@ class MarketChart(QWidget):
         self._percentage_axis = False
         self._visible_frame = pd.DataFrame()
         self._right_offset = 0
+        self.update()
+
+    def set_overlays(self, columns: list[str]) -> None:
+        self._overlay_columns = list(dict.fromkeys(columns))
         self.update()
 
     def zoom_in(self) -> None:
@@ -278,13 +282,10 @@ class MarketChart(QWidget):
         self, painter: QPainter, bounds: QRectF, frame: pd.DataFrame
     ) -> None:
         painter.setFont(QFont("Microsoft YaHei UI", 9))
-        items = [
-            ("K线", COLORS["text"]),
-            ("MA5", COLORS["ma5"]),
-            ("MA20", COLORS["ma20"]),
-            ("BOLL", COLORS["bb"]),
-            (self._custom_name, COLORS["custom"]),
-        ]
+        items = [("K线", COLORS["text"])]
+        for index, name in enumerate(self._overlay_columns[:6]):
+            items.append((name.replace("_", ""), self._overlay_color(index)))
+        items.append((self._custom_name, COLORS["custom"]))
         x = bounds.left() + 12
         for text, color in items:
             painter.setPen(color)
@@ -319,9 +320,7 @@ class MarketChart(QWidget):
         self, painter: QPainter, rect: QRectF, frame: pd.DataFrame
     ) -> None:
         overlay_columns = [
-            column
-            for column in ("SMA_5", "SMA_20", "BB_UPPER", "BB_LOWER")
-            if column in frame
+            column for column in self._overlay_columns if column in frame
         ]
         values = [frame["low"].min(), frame["high"].max()]
         for column in overlay_columns:
@@ -383,14 +382,10 @@ class MarketChart(QWidget):
             else:
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(body)
-        for column, color, width in (
-            ("SMA_5", COLORS["ma5"], 1.3),
-            ("SMA_20", COLORS["ma20"], 1.4),
-            ("BB_UPPER", COLORS["bb"], 1.0),
-            ("BB_LOWER", COLORS["bb"], 1.0),
-        ):
-            if column in frame:
-                self._draw_series(painter, rect, frame[column], map_y, color, width)
+        for index, column in enumerate(overlay_columns):
+            self._draw_series(
+                painter, rect, frame[column], map_y, self._overlay_color(index), 1.2
+            )
         painter.restore()
         self._draw_axis_labels(
             painter,
@@ -399,6 +394,22 @@ class MarketChart(QWidget):
             high_value,
             reference_price=reference,
         )
+
+    @staticmethod
+    def _overlay_color(index: int) -> QColor:
+        palette = (
+            "#FBBF24",
+            "#38BDF8",
+            "#A78BFA",
+            "#F472B6",
+            "#22D3EE",
+            "#FB7185",
+            "#84CC16",
+            "#F97316",
+            "#C084FC",
+            "#2DD4BF",
+        )
+        return QColor(palette[index % len(palette)])
 
     def _draw_volume_panel(
         self, painter: QPainter, rect: QRectF, frame: pd.DataFrame

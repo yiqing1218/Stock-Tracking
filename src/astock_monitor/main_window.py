@@ -1,21 +1,28 @@
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import QSettings, QThreadPool, Qt
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QApplication,
+    QMenu,
     QPushButton,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
+    QSystemTrayIcon,
 )
 
 from .data_provider import DataProvider
+from .data_management_page import DataManagementPage
 from .detail_page import DetailPage
+from .historical_store import HistoricalStore
 from .market_dashboard_page import MarketDashboardPage
 from .alerts import MessagePage
 from .models import Security
@@ -37,6 +44,7 @@ class MainWindow(QMainWindow):
         self.resize(1480, 900)
 
         self._last_watchlist_security: Security | None = None
+        self._force_quit = False
         shell = QWidget()
         shell_layout = QVBoxLayout(shell)
         shell_layout.setContentsMargins(0, 0, 0, 0)
@@ -60,8 +68,9 @@ class MainWindow(QMainWindow):
             ("screener", "条件荐股"),
             ("watchlist", "自选股票"),
             ("detail", "股票详情"),
-            ("strategy", "量化策略与回测"),
+            ("strategy", "量化策略/回测/指标"),
             ("alerts", "消息提示"),
+            ("data", "数据导出"),
         ):
             button = QPushButton(label)
             button.setObjectName("MainNavigationButton")
@@ -80,13 +89,19 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.market_page = MarketDashboardPage(provider, self.thread_pool)
-        self.screening_page = ScreeningPage(repository, provider, self.thread_pool)
+        self.historical_store = HistoricalStore(repository.database_path)
+        self.screening_page = ScreeningPage(
+            repository, provider, self.thread_pool, self.historical_store
+        )
         self.watchlist_page = WatchlistPage(repository, provider, self.thread_pool)
         self.detail_page = DetailPage(repository, provider, self.thread_pool)
         self.strategy_page = StrategyBacktestPage(
-            repository, provider, self.thread_pool
+            repository, provider, self.thread_pool, self.detail_page.custom_tab
         )
         self.alerts_page = MessagePage(repository, provider, self.thread_pool)
+        self.data_page = DataManagementPage(
+            repository, provider, self.historical_store, self.thread_pool
+        )
         self.pages = {
             "market": self.market_page,
             "screener": self.screening_page,
@@ -94,6 +109,7 @@ class MainWindow(QMainWindow):
             "detail": self.detail_page,
             "strategy": self.strategy_page,
             "alerts": self.alerts_page,
+            "data": self.data_page,
         }
         self.stack.addWidget(self.market_page)
         self.stack.addWidget(self.screening_page)
@@ -101,6 +117,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.detail_page)
         self.stack.addWidget(self.strategy_page)
         self.stack.addWidget(self.alerts_page)
+        self.stack.addWidget(self.data_page)
         shell_layout.addWidget(self.stack, 1)
         self.setCentralWidget(shell)
 
@@ -108,6 +125,7 @@ class MainWindow(QMainWindow):
         self.detail_page.back_requested.connect(self.show_watchlist)
         self.detail_page.watchlist_changed.connect(self.watchlist_page.start)
         self.alerts_page.unread_count_changed.connect(self._update_unread_count)
+        self._setup_tray()
         self._restore_geometry()
 
     def start(self) -> None:
@@ -190,7 +208,61 @@ class MainWindow(QMainWindow):
         if geometry:
             self.restoreGeometry(geometry)
 
-    def closeEvent(self, event: QCloseEvent) -> None:
+    def _setup_tray(self) -> None:
+        self.tray_icon: QSystemTrayIcon | None = None
+        if (
+            os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen"
+            or not QSystemTrayIcon.isSystemTrayAvailable()
+        ):
+            return
+        tray = QSystemTrayIcon(self.windowIcon(), self)
+        menu = QMenu()
+        show_action = QAction("显示澄鉴 A股监看", menu)
+        quit_action = QAction("退出", menu)
+        show_action.triggered.connect(self._restore_from_tray)
+        quit_action.triggered.connect(self._quit_from_tray)
+        menu.addAction(show_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        tray.setContextMenu(menu)
+        tray.activated.connect(
+            lambda reason: (
+                self._restore_from_tray()
+                if reason == QSystemTrayIcon.ActivationReason.DoubleClick
+                else None
+            )
+        )
+        self.alerts_page.desktop_notification.connect(
+            lambda title, message: tray.showMessage(
+                title, message, QSystemTrayIcon.MessageIcon.Information, 6000
+            )
+        )
+        tray.show()
+        self.tray_icon = tray
+
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self) -> None:
+        self._force_quit = True
         self.alerts_page.stop()
+        QApplication.instance().quit()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
         QSettings().setValue("window/geometry", self.saveGeometry())
+        if self.tray_icon is not None and not self._force_quit:
+            self.hide()
+            event.ignore()
+            if not getattr(self, "_tray_hint_shown", False):
+                self._tray_hint_shown = True
+                self.tray_icon.showMessage(
+                    "澄鉴 A股监看",
+                    "程序已在托盘继续运行提醒。",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    4000,
+                )
+            return
+        self.alerts_page.stop()
         super().closeEvent(event)

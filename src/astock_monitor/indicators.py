@@ -18,9 +18,9 @@ def resample_ohlcv(source: pd.DataFrame, period: str) -> pd.DataFrame:
 
     if period == "daily":
         return source.copy().reset_index(drop=True)
-    rules = {"weekly": "W-FRI", "monthly": "ME"}
+    rules = {"weekly": "W-FRI", "monthly": "ME", "yearly": "YE"}
     if period not in rules:
-        raise ValueError("K线周期只支持 daily、weekly、monthly")
+        raise ValueError("K线周期只支持 daily、weekly、monthly、yearly")
     if source is None or source.empty:
         return pd.DataFrame()
     frame = source.copy()

@@ -115,6 +115,9 @@ class DetailBundle:
     company_info: pd.DataFrame = field(default_factory=pd.DataFrame)
     business_info: pd.DataFrame = field(default_factory=pd.DataFrame)
     financials: pd.DataFrame = field(default_factory=pd.DataFrame)
+    balance_sheet: pd.DataFrame = field(default_factory=pd.DataFrame)
+    profit_sheet: pd.DataFrame = field(default_factory=pd.DataFrame)
+    cash_flow_sheet: pd.DataFrame = field(default_factory=pd.DataFrame)
     corporate_actions: pd.DataFrame = field(default_factory=pd.DataFrame)
     sources: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
@@ -278,6 +281,48 @@ class DataProvider:
             else:
                 quotes[security.key] = Quote(security=security)
         return quotes
+
+    def refresh_quotes_efficient(self, securities: list[Security]) -> dict[str, Quote]:
+        """Use one market snapshot for large alert targets, direct quotes for small sets."""
+        if len(securities) <= 80:
+            return self.refresh_quotes(securities)
+        by_code = {item.code: item for item in securities}
+        types = {item.security_type for item in securities}
+        try:
+            if types == {SecurityType.ETF}:
+                frame = ak.fund_etf_spot_em()
+                source = "AkShare·东方财富ETF实时快照"
+            else:
+                frame = self._load_extra_with_cache(
+                    "alert_market_snapshot",
+                    beijing_today().strftime("%Y%m%d"),
+                    self._load_market_spot,
+                    timedelta(seconds=20),
+                )
+                source = str(frame.attrs.get("source", "全A实时快照"))
+            code_column = next(
+                (
+                    column
+                    for column in ("代码", "基金代码", "证券代码")
+                    if column in frame
+                ),
+                None,
+            )
+            if code_column is None:
+                raise RuntimeError("快照缺少证券代码")
+            result: dict[str, Quote] = {}
+            for _, row in frame.iterrows():
+                code = self._normalized_code(row.get(code_column))
+                security = by_code.get(code)
+                if security is None:
+                    continue
+                quote = self._quote_from_spot_row(security, row)
+                quote.extra["source"] = source
+                result[security.key] = quote
+            return result
+        except Exception:
+            # A failed market-wide request must not fan out into thousands of HTTP calls.
+            return {item.key: Quote(security=item) for item in securities}
 
     def get_market_dashboard(self) -> MarketDashboardBundle:
         """Load index snapshots, A-share breadth and leading industries."""
@@ -873,7 +918,36 @@ class DataProvider:
                 tzinfo=ZoneInfo("Asia/Shanghai")
             )
             quote.extra["trade_datetime"] = timestamp.isoformat()
+        if len(values) >= 29:
+            quote.extra["order_book"] = {
+                "bids": [
+                    {
+                        "level": level,
+                        "price": _as_float(values[9 + (level - 1) * 2]),
+                        "volume": _as_float(values[10 + (level - 1) * 2]),
+                    }
+                    for level in range(1, 6)
+                ],
+                "asks": [
+                    {
+                        "level": level,
+                        "price": _as_float(values[19 + (level - 1) * 2]),
+                        "volume": _as_float(values[20 + (level - 1) * 2]),
+                    }
+                    for level in range(1, 6)
+                ],
+                "source": "腾讯公开五档行情（非Level-2）",
+            }
+        quote.extra["source"] = "腾讯行情"
         return quote
+
+    def get_order_book(self, security: Security) -> dict[str, object]:
+        """Return public five-level quotes. Never synthesizes missing depth."""
+        quote = self._fetch_tencent_quote(security)
+        order_book = quote.extra.get("order_book")
+        if not isinstance(order_book, dict):
+            raise RuntimeError("公开行情接口未返回五档盘口")
+        return {"quote": quote, **order_book}
 
     def _fetch_sina_quote(self, security: Security) -> Quote:
         symbol = self._market_symbol(security)
@@ -1377,7 +1451,7 @@ class DataProvider:
                 lambda: self._load_chips(security, history, adjustment),
                 "筹码分布接口暂时不可用",
                 timedelta(hours=6),
-                "东财筹码/本地成本模型",
+                "AkShare·东方财富公开筹码分布",
             ),
             (
                 "holders",
@@ -1406,6 +1480,27 @@ class DataProvider:
                 "财务指标接口暂时不可用",
                 timedelta(hours=12),
                 "AkShare·同花顺/新浪财务",
+            ),
+            (
+                "balance_sheet",
+                lambda: self._load_statement(security, "balance"),
+                "资产负债表接口暂时不可用",
+                timedelta(hours=12),
+                "AkShare·东方财富/新浪资产负债表",
+            ),
+            (
+                "profit_sheet",
+                lambda: self._load_statement(security, "profit"),
+                "利润表接口暂时不可用",
+                timedelta(hours=12),
+                "AkShare·东方财富/新浪利润表",
+            ),
+            (
+                "cash_flow_sheet",
+                lambda: self._load_statement(security, "cash_flow"),
+                "现金流量表接口暂时不可用",
+                timedelta(hours=12),
+                "AkShare·东方财富/新浪现金流量表",
             ),
             (
                 "corporate_actions",
@@ -1662,9 +1757,12 @@ class DataProvider:
             frame.attrs["source"] = "AkShare·东方财富筹码分布"
             return frame
         except Exception as exc:
-            frame = self._estimate_chips(history)
-            frame.attrs["source"] = "本地换手衰减成本模型估算"
-            frame.attrs["fallback_error"] = str(exc)
+            # Cost-distribution reconstruction is a model, not disclosed exchange data.
+            # Returning an explicit empty result prevents estimated values being shown as
+            # real chips, profit chips, average cost or concentration.
+            frame = pd.DataFrame()
+            frame.attrs["source"] = "东方财富筹码接口无可靠返回"
+            frame.attrs["error"] = str(exc)
             return frame
 
     @staticmethod
@@ -2080,6 +2178,35 @@ class DataProvider:
             except Exception as exc:
                 errors.append(exc)
         raise RuntimeError(str(errors[-1]) if errors else "财务指标为空")
+
+    @staticmethod
+    def _load_statement(security: Security, statement: str) -> pd.DataFrame:
+        symbol = f"{security.market.upper()}{security.code}"
+        names = {"balance": "资产负债表", "profit": "利润表", "cash_flow": "现金流量表"}
+        primary = {
+            "balance": ak.stock_balance_sheet_by_report_em,
+            "profit": ak.stock_profit_sheet_by_report_em,
+            "cash_flow": ak.stock_cash_flow_sheet_by_report_em,
+        }[statement]
+        errors: list[Exception] = []
+        for source, loader in (
+            ("AkShare·东方财富", lambda: primary(symbol=symbol)),
+            (
+                "AkShare·新浪",
+                lambda: ak.stock_financial_report_sina(
+                    stock=symbol.lower(), symbol=names[statement]
+                ),
+            ),
+        ):
+            try:
+                frame = loader()
+                if frame is not None and not frame.empty:
+                    frame = frame.copy()
+                    frame.attrs["source"] = f"{source}{names[statement]}"
+                    return frame
+            except Exception as exc:
+                errors.append(exc)
+        raise RuntimeError(str(errors[-1]) if errors else f"{names[statement]}为空")
 
     def _load_extra_with_cache(
         self,
