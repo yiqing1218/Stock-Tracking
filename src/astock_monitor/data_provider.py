@@ -225,6 +225,59 @@ class DataProvider:
                 quotes[security.key] = Quote(security=security)
         return quotes
 
+    def refresh_scores(self, securities: list[Security]) -> dict[str, float]:
+        """Calculate the same six-dimension score used by the detail page."""
+
+        from .indicators import calculate_indicators, market_regime
+
+        def calculate(security: Security) -> tuple[str, float]:
+            path = self.cache_dir / (
+                f"score_v2_{security.security_type.value}_{security.code}.json"
+            )
+            if self._cache_is_fresh(path, timedelta(minutes=10)):
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    return security.key, float(value["score"])
+                except (OSError, TypeError, ValueError, KeyError):
+                    pass
+            history = self.get_history(
+                security, use_cache=True, adjustment="qfq", include_live=True
+            )
+            frame = calculate_indicators(history, include_extended=True)
+            score = float(market_regime(frame)["score"])
+            path.write_text(
+                json.dumps(
+                    {
+                        "score": score,
+                        "beijing_time": beijing_today().isoformat(),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            return security.key, score
+
+        scores: dict[str, float] = {}
+        with ThreadPoolExecutor(max_workers=min(2, max(1, len(securities)))) as executor:
+            futures = {executor.submit(calculate, security): security for security in securities}
+            for future in as_completed(futures):
+                security = futures[future]
+                try:
+                    key, score = future.result()
+                    scores[key] = score
+                except Exception:
+                    path = self.cache_dir / (
+                        f"score_v2_{security.security_type.value}_{security.code}.json"
+                    )
+                    if path.exists():
+                        try:
+                            scores[security.key] = float(
+                                json.loads(path.read_text(encoding="utf-8"))["score"]
+                            )
+                        except (OSError, TypeError, ValueError, KeyError):
+                            pass
+        return scores
+
     def _fetch_direct_quote(self, security: Security) -> Quote:
         errors: list[str] = []
         for source, loader in (
@@ -661,17 +714,17 @@ class DataProvider:
         extras: tuple[tuple[str, Callable[[], pd.DataFrame], str, timedelta, str], ...] = (
             (
                 "fund_flow",
-                lambda: ak.stock_individual_fund_flow(stock=security.code, market=security.market),
+                lambda: self._load_fund_flow(security, history),
                 "主力资金流接口暂时不可用",
                 timedelta(hours=1),
-                "AkShare·东方财富资金流",
+                "多源资金流",
             ),
             (
                 "chips",
-                lambda: ak.stock_cyq_em(symbol=security.code, adjust=adjustment),
+                lambda: self._load_chips(security, history, adjustment),
                 "筹码分布接口暂时不可用",
                 timedelta(hours=6),
-                "AkShare·东方财富筹码",
+                "东财筹码/本地成本模型",
             ),
             (
                 "holders",
@@ -714,10 +767,222 @@ class DataProvider:
                 try:
                     frame = future.result()
                     setattr(bundle, attribute, frame if frame is not None else pd.DataFrame())
-                    bundle.sources[attribute] = source
+                    bundle.sources[attribute] = str(
+                        getattr(frame, "attrs", {}).get("source", source)
+                    )
                 except Exception:
                     bundle.warnings.append(warning)
         return bundle
+
+    @staticmethod
+    def _normalized_code(value: object) -> str:
+        digits = re.sub(r"\D", "", str(value or ""))
+        return digits[-6:].zfill(6) if digits else ""
+
+    @staticmethod
+    def _chinese_number(value: object) -> float | None:
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            return None
+        if isinstance(value, (int, float, np.number)):
+            return _as_float(value)
+        text = str(value).strip().replace(",", "").replace("%", "")
+        match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        multiplier = 100_000_000 if "亿" in text else 10_000 if "万" in text else 1
+        return float(match.group()) * multiplier
+
+    def _snapshot_fund_flow(
+        self, frame: pd.DataFrame, security: Security, source: str
+    ) -> pd.DataFrame:
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+        code_column = next(
+            (column for column in ("代码", "股票代码", "证券代码") if column in frame),
+            None,
+        )
+        if code_column is None:
+            return pd.DataFrame()
+        matched = frame[
+            frame[code_column].map(self._normalized_code) == security.code
+        ]
+        if matched.empty:
+            return pd.DataFrame()
+        row = matched.iloc[0]
+
+        def number(*columns: str) -> float | None:
+            for column in columns:
+                if column in row.index:
+                    parsed = self._chinese_number(row.get(column))
+                    if parsed is not None:
+                        return parsed
+            return None
+
+        main = number("今日主力净流入-净额", "主力净流入-净额", "净额")
+        amount = number("成交额")
+        ratio = number("今日主力净流入-净占比", "主力净流入-净占比")
+        if ratio is None and main is not None and amount:
+            ratio = main / amount * 100
+        result = pd.DataFrame(
+            [
+                {
+                    "日期": f"{beijing_today():%Y-%m-%d}",
+                    "主力净流入-净额": main,
+                    "主力净流入-净占比": ratio,
+                    "超大单净流入-净额": number("今日超大单净流入-净额", "超大单净流入-净额"),
+                    "大单净流入-净额": number("今日大单净流入-净额", "大单净流入-净额"),
+                    "中单净流入-净额": number("今日中单净流入-净额", "中单净流入-净额"),
+                    "小单净流入-净额": number("今日小单净流入-净额", "小单净流入-净额"),
+                }
+            ]
+        )
+        if result["主力净流入-净额"].isna().all():
+            return pd.DataFrame()
+        result.attrs["source"] = source
+        return result
+
+    def _load_fund_flow(
+        self, security: Security, history: pd.DataFrame
+    ) -> pd.DataFrame:
+        errors: list[str] = []
+        loaders: tuple[tuple[str, Callable[[], pd.DataFrame]], ...] = (
+            (
+                "AkShare·东方财富个股近100日资金流",
+                lambda: ak.stock_individual_fund_flow(
+                    stock=security.code, market=security.market
+                ),
+            ),
+            (
+                "AkShare·东方财富全市场当日资金流",
+                lambda: self._snapshot_fund_flow(
+                    ak.stock_individual_fund_flow_rank(indicator="今日"),
+                    security,
+                    "AkShare·东方财富全市场当日资金流",
+                ),
+            ),
+            (
+                "AkShare·同花顺个股资金流",
+                lambda: self._snapshot_fund_flow(
+                    ak.stock_fund_flow_individual(symbol="即时"),
+                    security,
+                    "AkShare·同花顺个股资金流",
+                ),
+            ),
+        )
+        for source, loader in loaders:
+            try:
+                # 单个公开源卡住时必须尽快切换，不能让整个详情页等到外层超时。
+                frame = self._call_with_timeout(loader, 4)
+                if frame is None or frame.empty:
+                    raise RuntimeError("未找到该股票")
+                frame = frame.copy()
+                frame.attrs["source"] = frame.attrs.get("source", source)
+                return frame
+            except Exception as exc:
+                errors.append(f"{source}: {exc}")
+        estimated = self._estimate_fund_flow(history)
+        estimated.attrs["source"] = "本地OHLCV资金流估算（非逐笔主力）"
+        estimated.attrs["fallback_errors"] = errors
+        return estimated
+
+    def _estimate_fund_flow(self, history: pd.DataFrame) -> pd.DataFrame:
+        if history is None or history.empty:
+            return pd.DataFrame()
+        frame = history.copy().tail(120)
+        span = (frame["high"] - frame["low"]).replace(0, np.nan)
+        multiplier = (((frame["close"] - frame["low"]) - (frame["high"] - frame["close"])) / span).fillna(0)
+        typical = (frame["high"] + frame["low"] + frame["close"]) / 3
+        amount = pd.to_numeric(frame.get("amount"), errors="coerce")
+        amount = amount.where(amount > 0, typical * pd.to_numeric(frame["volume"], errors="coerce") * 100)
+        main = multiplier * amount
+        return pd.DataFrame(
+            {
+                "日期": pd.to_datetime(frame["date"], errors="coerce").dt.strftime("%Y-%m-%d"),
+                "主力净流入-净额": main,
+                "主力净流入-净占比": multiplier * 100,
+                "超大单净流入-净额": main * 0.35,
+                "大单净流入-净额": main * 0.65,
+                "中单净流入-净额": -main * 0.35,
+                "小单净流入-净额": -main * 0.65,
+            }
+        ).reset_index(drop=True)
+
+    def _load_chips(
+        self, security: Security, history: pd.DataFrame, adjustment: str
+    ) -> pd.DataFrame:
+        try:
+            frame = self._call_with_timeout(
+                lambda: ak.stock_cyq_em(symbol=security.code, adjust=adjustment),
+                6,
+            )
+            if frame is None or frame.empty:
+                raise RuntimeError("筹码接口返回空数据")
+            frame = frame.copy()
+            frame.attrs["source"] = "AkShare·东方财富筹码分布"
+            return frame
+        except Exception as exc:
+            frame = self._estimate_chips(history)
+            frame.attrs["source"] = "本地换手衰减成本模型估算"
+            frame.attrs["fallback_error"] = str(exc)
+            return frame
+
+    @staticmethod
+    def _weighted_quantile(
+        prices: np.ndarray, weights: np.ndarray, quantile: float
+    ) -> float:
+        cumulative = np.cumsum(weights)
+        if cumulative.size == 0 or cumulative[-1] <= 0:
+            return float("nan")
+        return float(np.interp(quantile * cumulative[-1], cumulative, prices))
+
+    def _estimate_chips(self, history: pd.DataFrame) -> pd.DataFrame:
+        """Estimate a cost distribution from OHLC and turnover when CYQ is unavailable."""
+
+        if history is None or history.empty:
+            return pd.DataFrame()
+        frame = history.copy().dropna(subset=["date", "high", "low", "close"])
+        if frame.empty:
+            return pd.DataFrame()
+        price_low = max(float(frame["low"].min()) * 0.96, 1e-6)
+        price_high = float(frame["high"].max()) * 1.04
+        prices = np.linspace(price_low, max(price_high, price_low * 1.02), 180)
+        weights = np.zeros_like(prices)
+        records: list[dict[str, object]] = []
+        for _, row in frame.iterrows():
+            close = float(row["close"])
+            typical = float((row["high"] + row["low"] + row["close"]) / 3)
+            turnover = _as_float(row.get("turnover"))
+            turnover_fraction = float(np.clip((turnover or 2.5) / 100, 0.001, 1.0))
+            sigma = max(float(row["high"] - row["low"]) / 2.8, close * 0.004)
+            new_distribution = np.exp(-0.5 * ((prices - typical) / sigma) ** 2)
+            total = float(new_distribution.sum())
+            if total > 0:
+                new_distribution /= total
+            weights *= 1 - turnover_fraction
+            weights += new_distribution * turnover_fraction
+            weight_total = float(weights.sum())
+            if weight_total <= 0:
+                continue
+            normalized = weights / weight_total
+            average = float(np.sum(prices * normalized))
+            low90 = self._weighted_quantile(prices, normalized, 0.05)
+            high90 = self._weighted_quantile(prices, normalized, 0.95)
+            low70 = self._weighted_quantile(prices, normalized, 0.15)
+            high70 = self._weighted_quantile(prices, normalized, 0.85)
+            records.append(
+                {
+                    "日期": pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
+                    "获利比例": float(normalized[prices <= close].sum()),
+                    "平均成本": average,
+                    "90成本-低": low90,
+                    "90成本-高": high90,
+                    "90集中度": (high90 - low90) / max(high90 + low90, 1e-12),
+                    "70成本-低": low70,
+                    "70成本-高": high70,
+                    "70集中度": (high70 - low70) / max(high70 + low70, 1e-12),
+                }
+            )
+        return pd.DataFrame(records).tail(120).reset_index(drop=True)
 
     def get_intraday(
         self,
@@ -1010,19 +1275,33 @@ class DataProvider:
         max_age: timedelta,
     ) -> pd.DataFrame:
         path = self.cache_dir / f"{name}_{code}.csv"
+        source_path = self.cache_dir / f"{name}_{code}.source.txt"
         if self._cache_is_fresh(path, max_age):
             cached = self._read_raw_frame(path)
             if not cached.empty:
+                if source_path.exists():
+                    try:
+                        cached.attrs["source"] = source_path.read_text(encoding="utf-8").strip()
+                    except OSError:
+                        pass
                 return cached
         try:
             frame = self._call_with_timeout(loader, 15)
             if frame is None or frame.empty:
                 raise RuntimeError("数据源返回空数据")
             frame.to_csv(path, index=False, encoding="utf-8-sig")
+            source = str(frame.attrs.get("source", "")).strip()
+            if source:
+                source_path.write_text(source, encoding="utf-8")
             return frame
         except Exception:
             cached = self._read_raw_frame(path)
             if not cached.empty:
+                if source_path.exists():
+                    try:
+                        cached.attrs["source"] = source_path.read_text(encoding="utf-8").strip()
+                    except OSError:
+                        pass
                 return cached
             raise
 

@@ -75,6 +75,30 @@ def rank_security_search(
     return (exact + prefix + contains)[:limit]
 
 
+class SortableTableWidgetItem(QTableWidgetItem):
+    def __init__(self, text: str, sort_value: float | None = None) -> None:
+        super().__init__(text)
+        self.sort_value = sort_value
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        if isinstance(other, SortableTableWidgetItem):
+            table = self.tableWidget()
+            order = (
+                table.horizontalHeader().sortIndicatorOrder()
+                if table is not None
+                else Qt.SortOrder.AscendingOrder
+            )
+            missing = (
+                float("inf")
+                if order == Qt.SortOrder.AscendingOrder
+                else float("-inf")
+            )
+            left = self.sort_value if self.sort_value is not None else missing
+            right = other.sort_value if other.sort_value is not None else missing
+            return left < right
+        return super().__lt__(other)
+
+
 class WatchlistPage(QWidget):
     open_security = Signal(object)
 
@@ -92,6 +116,7 @@ class WatchlistPage(QWidget):
         "市盈率",
         "市净率",
         "总市值",
+        "评分",
         "数据源",
     ]
 
@@ -112,7 +137,9 @@ class WatchlistPage(QWidget):
         self.search_index: dict[str, list[Security]] = {}
         self.visible_securities: list[Security] = []
         self.quotes: dict[str, Quote] = {}
+        self.scores: dict[str, float] = {}
         self._quote_running = False
+        self._score_running = False
         self._universe_loaded = False
         self._universe_loading = False
         self._active_workers: set[Worker] = set()
@@ -226,6 +253,8 @@ class WatchlistPage(QWidget):
         header_view.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header_view.setMinimumSectionSize(72)
+        self.table.setSortingEnabled(True)
+        header_view.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
         root.addWidget(self.table, 1)
 
         disclaimer = QLabel(
@@ -422,6 +451,7 @@ class WatchlistPage(QWidget):
         now = beijing_now()
         self.update_label.setText(f"北京时间 {now:%H:%M:%S} 更新")
         self.market_label.setText(self._market_status_text())
+        self._refresh_scores()
 
     def _on_quote_error(self, message: str) -> None:
         self.update_label.setText(f"行情更新失败：{message}")
@@ -431,7 +461,32 @@ class WatchlistPage(QWidget):
         self.refresh_button.setEnabled(True)
         self.refresh_button.setText("刷新行情")
 
+    def _refresh_scores(self) -> None:
+        if self._score_running:
+            return
+        securities = self.repository.list_watchlist()
+        if not securities:
+            return
+        self._score_running = True
+        worker = Worker(self.provider.refresh_scores, securities)
+        worker.signals.result.connect(self._on_scores_loaded)
+        worker.signals.finished.connect(self._score_finished)
+        self._start_worker(worker)
+
+    def _on_scores_loaded(self, result: object) -> None:
+        if isinstance(result, dict):
+            self.scores.update(
+                {str(key): float(value) for key, value in result.items()}
+            )
+        self._render_table()
+
+    def _score_finished(self) -> None:
+        self._score_running = False
+
     def _render_table(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        sort_section = self.table.horizontalHeader().sortIndicatorSection()
+        sort_order = self.table.horizontalHeader().sortIndicatorOrder()
+        self.table.setSortingEnabled(False)
         group_id = self.group_filter.currentData() if hasattr(self, "group_filter") else None
         securities = self.repository.list_watchlist(int(group_id) if group_id is not None else None)
         self.visible_securities = securities
@@ -465,31 +520,62 @@ class WatchlistPage(QWidget):
                 format_number(quote.pe),
                 format_number(quote.pb),
                 format_number(quote.market_cap),
+                f"{self.scores[security.key]:.0f}" if security.key in self.scores else "—",
                 str(quote.extra.get("source", "—")),
             ]
             for column_index, text in enumerate(values, start=1):
-                item = QTableWidgetItem(text)
+                numeric_values = {
+                    4: quote.price,
+                    5: quote.change_pct,
+                    6: quote.change,
+                    7: quote.amount,
+                    8: quote.turnover,
+                    9: quote.volume_ratio,
+                    10: quote.pe,
+                    11: quote.pb,
+                    12: quote.market_cap,
+                    13: self.scores.get(security.key),
+                }
+                item = (
+                    SortableTableWidgetItem(text, numeric_values[column_index])
+                    if column_index in numeric_values
+                    else QTableWidgetItem(text)
+                )
                 item.setData(Qt.ItemDataRole.UserRole, security.to_dict())
                 if column_index in (4, 5, 6):
                     item.setForeground(QColor(change_color(change_pct)))
-                if 4 <= column_index <= 12:
+                if 4 <= column_index <= 13:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if column_index == 13 and numeric_values[column_index] is not None:
+                    score = float(numeric_values[column_index])
+                    item.setForeground(
+                        QColor(UP_COLOR if score >= 60 else DOWN_COLOR if score <= 40 else "#A8B6C9")
+                    )
                 self.table.setItem(row_index, column_index, item)
 
         self._set_summary_value(self.count_label, str(len(self.repository.list_watchlist())))
         self._set_summary_value(self.up_label, str(up))
         self._set_summary_value(self.down_label, str(down))
         self._set_summary_value(self.flat_label, str(flat))
+        self.table.setSortingEnabled(True)
+        if sort_section >= 0:
+            self.table.sortItems(sort_section, sort_order)
 
     def _open_row(self, row: int, _column: int) -> None:
-        if 0 <= row < len(self.visible_securities):
-            self.open_security.emit(self.visible_securities[row])
+        security = self._security_at_row(row)
+        if security is not None:
+            self.open_security.emit(security)
+
+    def _security_at_row(self, row: int) -> Security | None:
+        item = self.table.item(row, 0)
+        value = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return Security.from_dict(value) if isinstance(value, dict) else None
 
     def _show_context_menu(self, position) -> None:  # type: ignore[no-untyped-def]
         row = self.table.rowAt(position.y())
-        if row < 0 or row >= len(self.visible_securities):
+        security = self._security_at_row(row)
+        if security is None:
             return
-        security = self.visible_securities[row]
         menu = QMenu(self)
         open_action = QAction("打开详情", menu)
         up_action = QAction("上移", menu)

@@ -8,6 +8,7 @@ from PySide6.QtCore import QDate, QThreadPool, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QFrame,
@@ -35,11 +36,14 @@ from .chart_widget import MarketChart
 from .data_provider import DataProvider, DetailBundle
 from .formula_engine import FORMULA_HELP, FormulaEngine, FormulaError
 from .indicators import (
+    IndicatorDefinition,
     IndicatorSnapshot,
     build_indicator_snapshot,
     calculate_indicators,
     candle_pattern_summary,
+    dimension_composites,
     market_regime,
+    resample_ohlcv,
 )
 from .models import CustomIndicator, NewsArticle, Security, SecurityType
 from .repository import Repository
@@ -62,8 +66,6 @@ class DetailPage(QWidget):
     back_requested = Signal()
     watchlist_changed = Signal()
 
-    RANGE_MAP = {"3月": 66, "6月": 132, "1年": 264, "3年": 792, "全部": None}
-
     def __init__(
         self,
         repository: Repository,
@@ -81,7 +83,7 @@ class DetailPage(QWidget):
         self.snapshots: list[IndicatorSnapshot] = []
         self.custom_series: pd.Series | None = None
         self.custom_series_name = "自定义指标"
-        self.current_range: int | None = 264
+        self.chart_period = "daily"
         self._load_token = 0
         self._intraday_token = 0
         self._news_token = 0
@@ -90,6 +92,7 @@ class DetailPage(QWidget):
         self._news_running = False
         self._adjustment = "qfq"
         self._active_workers: set[Worker] = set()
+        self.indicator_favorites: set[str] = set()
         self.news_articles: list[NewsArticle] = []
         self._build_ui()
 
@@ -163,18 +166,20 @@ class DetailPage(QWidget):
         layout.setContentsMargins(0, 12, 0, 0)
         layout.setSpacing(10)
         toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("显示区间"))
-        self.range_buttons: dict[str, QPushButton] = {}
-        for label in self.RANGE_MAP:
+        toolbar.addWidget(QLabel("K线周期"))
+        self.period_buttons: dict[str, QPushButton] = {}
+        for label, period in (("日K", "daily"), ("周K", "weekly"), ("月K", "monthly")):
             button = QPushButton(label)
             button.setCheckable(True)
             button.setFixedWidth(58)
-            button.clicked.connect(lambda checked=False, name=label: self._select_range(name))
-            self.range_buttons[label] = button
+            button.clicked.connect(
+                lambda checked=False, value=period: self._select_chart_period(value)
+            )
+            self.period_buttons[period] = button
             toolbar.addWidget(button)
-        self.range_buttons["1年"].setChecked(True)
+        self.period_buttons["daily"].setChecked(True)
         toolbar.addSpacing(10)
-        tip = QLabel("滚轮缩放；双击日K进入当天1分钟分时；红涨绿跌")
+        tip = QLabel("滚轮或＋/－缩放；←/→或键盘方向键平移；双击K线进入分时")
         tip.setObjectName("Tiny")
         toolbar.addWidget(tip)
         toolbar.addStretch(1)
@@ -184,9 +189,37 @@ class DetailPage(QWidget):
         layout.addLayout(toolbar)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        chart_container = QWidget()
+        chart_layout = QGridLayout(chart_container)
+        chart_layout.setContentsMargins(0, 0, 0, 0)
         self.market_chart = MarketChart()
         self.market_chart.date_activated.connect(self._open_intraday_for_date)
-        splitter.addWidget(self.market_chart)
+        chart_layout.addWidget(self.market_chart, 0, 0)
+        chart_controls = QFrame()
+        chart_controls.setObjectName("ChartControls")
+        chart_controls_layout = QHBoxLayout(chart_controls)
+        chart_controls_layout.setContentsMargins(5, 5, 5, 5)
+        chart_controls_layout.setSpacing(4)
+        for text, tooltip, callback in (
+            ("＋", "放大K线", self.market_chart.zoom_in),
+            ("－", "缩小K线", self.market_chart.zoom_out),
+            ("←", "向左查看更早K线", self.market_chart.pan_left),
+            ("→", "向右查看更新K线", self.market_chart.pan_right),
+        ):
+            control = QPushButton(text)
+            control.setObjectName("ChartControl")
+            control.setFixedSize(34, 32)
+            control.setToolTip(tooltip)
+            control.clicked.connect(callback)
+            control.clicked.connect(lambda checked=False: self.market_chart.setFocus())
+            chart_controls_layout.addWidget(control)
+        chart_layout.addWidget(
+            chart_controls,
+            0,
+            0,
+            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
+        )
+        splitter.addWidget(chart_container)
         insights = QFrame()
         insights.setObjectName("Section")
         insights.setMinimumWidth(315)
@@ -223,15 +256,15 @@ class DetailPage(QWidget):
         self.regime_summary.setObjectName("Muted")
         self.regime_summary.setMinimumHeight(70)
         insight_layout.addWidget(self.regime_summary)
-        self.chip_distribution_chart = ChipDistributionWidget()
-        self.chip_distribution_chart.setMaximumHeight(235)
-        insight_layout.addWidget(self.chip_distribution_chart)
         self.signal_table = QTableWidget(0, 3)
         self.signal_table.setHorizontalHeaderLabels(["维度", "指标", "状态"])
         configure_table(self.signal_table, alternating=False)
         self.signal_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.signal_table.verticalHeader().setDefaultSectionSize(36)
-        insight_layout.addWidget(self.signal_table, 1)
+        self.signal_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.signal_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.signal_table.setMinimumHeight(260)
+        insight_layout.addWidget(self.signal_table)
         note = QLabel("状态摘要仅用于把多类指标放在同一语境中，不代表确定性预测。")
         note.setObjectName("Tiny")
         note.setWordWrap(True)
@@ -463,16 +496,26 @@ class DetailPage(QWidget):
         controls.addWidget(self.indicator_search, 1)
         controls.addWidget(self.indicator_category)
         controls.addWidget(self.indicator_count)
+        self.favorite_only_button = QPushButton("☆ 只看关注")
+        self.favorite_only_button.setObjectName("FavoriteFilter")
+        self.favorite_only_button.setCheckable(True)
+        self.favorite_only_button.toggled.connect(self._toggle_favorite_filter)
+        controls.addWidget(self.favorite_only_button)
         layout.addLayout(controls)
-        self.indicator_table = QTableWidget(0, 5)
-        self.indicator_table.setHorizontalHeaderLabels(["分类", "指标", "最新值", "状态", "逻辑与含义"])
+        self.indicator_table = QTableWidget(0, 7)
+        self.indicator_table.setHorizontalHeaderLabels(
+            ["分类", "指标", "来源", "最新值", "状态", "逻辑与含义", "关注"]
+        )
         configure_table(self.indicator_table)
         header = self.indicator_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(6, 58)
         layout.addWidget(self.indicator_table, 1)
         note = QLabel("指标采用公开 OHLCV/成交额/换手率数据计算；均线和波动指标具有滞后性，应结合市场环境使用。")
         note.setObjectName("Tiny")
@@ -512,6 +555,16 @@ class DetailPage(QWidget):
         self.formula_name.setPlaceholderText("例如：20日量价强度")
         name_row.addWidget(self.formula_name, 1)
         editor_layout.addLayout(name_row)
+        classification_row = QHBoxLayout()
+        classification_row.addWidget(QLabel("归属维度"))
+        self.formula_category = QComboBox()
+        self.formula_category.addItems(["趋势", "动量", "波动", "量能", "情绪", "风险"])
+        classification_row.addWidget(self.formula_category)
+        self.formula_in_library = QCheckBox("加入全部指标库")
+        self.formula_in_library.setToolTip("加入后会出现在“全部指标”，并参与对应维度的综合状态")
+        classification_row.addWidget(self.formula_in_library)
+        classification_row.addStretch(1)
+        editor_layout.addLayout(classification_row)
         editor_layout.addWidget(QLabel("公式"))
         self.formula_edit = QTextEdit()
         self.formula_edit.setPlaceholderText("例如：(close / SMA(close, 20) - 1) * 100")
@@ -562,6 +615,7 @@ class DetailPage(QWidget):
         self._detail_running = True
         self._intraday_running = False
         self._news_running = False
+        self.indicator_favorites = self.repository.list_indicator_favorites()
         self.intraday_button.setEnabled(True)
         self.news_refresh_button.setEnabled(True)
         self.security_name.setText(security.name)
@@ -578,7 +632,6 @@ class DetailPage(QWidget):
         self.intraday_period.setCurrentIndex(0)
         self._update_watchlist_button()
         self.market_chart.clear()
-        self.chip_distribution_chart.clear()
         self.chip_detail_chart.clear()
         self.intraday_chart.clear()
         self.intraday_status.setText("请选择交易日并点击“加载分时”。")
@@ -603,7 +656,7 @@ class DetailPage(QWidget):
         self, security: Security, adjustment: str, token: int
     ) -> tuple[int, DetailBundle, pd.DataFrame]:
         bundle = self.provider.get_detail_bundle(security, adjustment=adjustment)
-        calculated = calculate_indicators(bundle.history)
+        calculated = calculate_indicators(bundle.history, include_extended=True)
         return token, bundle, calculated
 
     def _on_bundle_loaded(self, result: object) -> None:
@@ -614,7 +667,7 @@ class DetailPage(QWidget):
             return
         self.bundle = bundle
         self.indicator_frame = calculated
-        self.snapshots = build_indicator_snapshot(calculated)
+        self._rebuild_indicator_library()
         warnings = "；".join(bundle.warnings)
         history_source = bundle.sources.get("日线", "未知来源")
         self.loading_label.setText(f"已加载 {len(calculated)} 个交易日 · {history_source}")
@@ -667,10 +720,12 @@ class DetailPage(QWidget):
             f"开 {last['open']:.2f}  高 {last['high']:.2f}  低 {last['low']:.2f}  收 {last['close']:.2f}  量 {format_number(last['volume'])}"
         )
 
-    def _select_range(self, label: str) -> None:
-        self.current_range = self.RANGE_MAP[label]
-        for name, button in self.range_buttons.items():
-            button.setChecked(name == label)
+    def _select_chart_period(self, period: str) -> None:
+        if period not in {"daily", "weekly", "monthly"}:
+            return
+        self.chart_period = period
+        for name, button in self.period_buttons.items():
+            button.setChecked(name == period)
         self._update_charts()
 
     def _change_adjustment(self) -> None:
@@ -704,13 +759,16 @@ class DetailPage(QWidget):
             self.fundamental_stack.setCurrentIndex(index)
 
     def _visible_frame(self) -> pd.DataFrame:
-        if self.current_range is None:
-            return self.indicator_frame
-        return self.indicator_frame.tail(self.current_range)
+        return self.indicator_frame
 
     def _update_charts(self) -> None:
+        if self.bundle is not None:
+            market_history = resample_ohlcv(self.bundle.history, self.chart_period)
+            market_frame = calculate_indicators(market_history, include_extended=False)
+        else:
+            market_frame = self._visible_frame()
+        self.market_chart.set_data(market_frame)
         visible = self._visible_frame()
-        self.market_chart.set_data(visible)
         if self.custom_series is not None:
             series = self.custom_series.reindex(visible.index)
             self.custom_chart.set_data(visible, series, self.custom_series_name)
@@ -734,21 +792,18 @@ class DetailPage(QWidget):
             f"{regime['summary']} 当前K线：{candle_pattern_summary(self.indicator_frame)}。"
             "趋势、位置、量能应共同判断，单一超买/超卖不等于立即反转。"
         )
-        signal_columns = [
-            ("趋势", "MACD柱", "MACD_HIST"),
-            ("动量", "RSI14", "RSI_14"),
-            ("波动", "布林带宽", "BB_WIDTH"),
-            ("量能", "CMF20", "CMF_20"),
-            ("情绪", "BIAS12", "BIAS_12"),
-            ("风险", "当前回撤", "DRAWDOWN"),
-        ]
-        by_column = {snapshot.definition.column: snapshot for snapshot in self.snapshots}
-        self.signal_table.setRowCount(len(signal_columns))
-        for row, (category, name, column) in enumerate(signal_columns):
-            snapshot = by_column.get(column)
+        composites = dimension_composites(self.snapshots)
+        dimensions = ("趋势", "动量", "波动", "量能", "情绪", "风险")
+        self.signal_table.setRowCount(len(dimensions))
+        for row, category in enumerate(dimensions):
+            composite = composites[category]
             self.signal_table.setItem(row, 0, QTableWidgetItem(category))
-            self.signal_table.setItem(row, 1, QTableWidgetItem(name))
-            pill = StatusPill(snapshot.status if snapshot else "数据不足")
+            self.signal_table.setItem(
+                row, 1, QTableWidgetItem(f"综合 {int(composite['count'])} 项")
+            )
+            pill = StatusPill(
+                f"{composite['status']} · {float(composite['score']):.0f}"
+            )
             self.signal_table.setCellWidget(row, 2, pill)
 
     def _populate_indicators(self) -> None:
@@ -760,27 +815,94 @@ class DetailPage(QWidget):
                 value += definition.unit
             self.indicator_table.setItem(row, 0, QTableWidgetItem(definition.category))
             self.indicator_table.setItem(row, 1, QTableWidgetItem(definition.name))
+            self.indicator_table.setItem(row, 2, QTableWidgetItem(definition.origin))
             value_item = QTableWidgetItem(value)
             value_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.indicator_table.setItem(row, 2, value_item)
-            self.indicator_table.setCellWidget(row, 3, StatusPill(snapshot.status))
+            self.indicator_table.setItem(row, 3, value_item)
+            self.indicator_table.setCellWidget(row, 4, StatusPill(snapshot.status))
             description = QTableWidgetItem(definition.description)
             description.setForeground(QColor("#A8B6C9"))
-            self.indicator_table.setItem(row, 4, description)
+            self.indicator_table.setItem(row, 5, description)
+            identifier = definition.identifier
+            favorite = identifier in self.indicator_favorites
+            button = QPushButton("★" if favorite else "☆")
+            button.setObjectName("FavoriteStar")
+            button.setCheckable(True)
+            button.setChecked(favorite)
+            button.setToolTip("取消关注" if favorite else "关注该指标")
+            button.toggled.connect(
+                lambda checked=False, key=identifier, control=button: self._toggle_indicator_favorite(
+                    key, checked, control
+                )
+            )
+            self.indicator_table.setCellWidget(row, 6, button)
         self._filter_indicators()
+
+    def _rebuild_indicator_library(self) -> None:
+        if self.indicator_frame.empty:
+            self.snapshots = []
+            return
+        custom_columns = [
+            column for column in self.indicator_frame if str(column).startswith("CUSTOM_")
+        ]
+        if custom_columns:
+            self.indicator_frame = self.indicator_frame.drop(columns=custom_columns)
+        definitions: list[IndicatorDefinition] = []
+        engine = FormulaEngine(self.indicator_frame)
+        for indicator in self.repository.list_custom_indicators():
+            if not indicator.in_library or indicator.id is None:
+                continue
+            try:
+                series = engine.evaluate(indicator.formula)
+            except FormulaError:
+                continue
+            column = f"CUSTOM_{indicator.id}"
+            self.indicator_frame[column] = series
+            definitions.append(
+                IndicatorDefinition(
+                    indicator.category,
+                    indicator.name,
+                    column,
+                    f"自定义公式：{indicator.formula}",
+                    origin="自定义",
+                    key=f"custom:{indicator.id}",
+                )
+            )
+        self.indicator_frame.attrs["custom_indicator_definitions"] = definitions
+        self.snapshots = build_indicator_snapshot(self.indicator_frame)
 
     def _filter_indicators(self, *_args) -> None:  # type: ignore[no-untyped-def]
         query = self.indicator_search.text().strip().lower()
         category = self.indicator_category.currentText()
+        favorites_only = self.favorite_only_button.isChecked()
         shown = 0
         for row, snapshot in enumerate(self.snapshots):
             definition = snapshot.definition
             matches_query = not query or query in definition.name.lower() or query in definition.description.lower() or query in definition.column.lower()
             matches_category = category == "全部分类" or category == definition.category
-            visible = matches_query and matches_category
+            matches_favorite = (
+                not favorites_only or definition.identifier in self.indicator_favorites
+            )
+            visible = matches_query and matches_category and matches_favorite
             self.indicator_table.setRowHidden(row, not visible)
             shown += int(visible)
         self.indicator_count.setText(f"{shown} / {len(self.snapshots)} 项")
+
+    def _toggle_favorite_filter(self, checked: bool) -> None:
+        self.favorite_only_button.setText("★ 只看关注" if checked else "☆ 只看关注")
+        self._filter_indicators()
+
+    def _toggle_indicator_favorite(
+        self, identifier: str, checked: bool, button: QPushButton
+    ) -> None:
+        self.repository.set_indicator_favorite(identifier, checked)
+        if checked:
+            self.indicator_favorites.add(identifier)
+        else:
+            self.indicator_favorites.discard(identifier)
+        button.setText("★" if checked else "☆")
+        button.setToolTip("取消关注" if checked else "关注该指标")
+        self._filter_indicators()
 
     def _populate_capital(self) -> None:
         if self.bundle is None:
@@ -793,10 +915,16 @@ class DetailPage(QWidget):
         self._populate_flow(self.bundle.fund_flow)
         self._populate_chips(self.bundle.chips)
         self._populate_holders(self.bundle.holders)
+        flow_source = self.bundle.sources.get("fund_flow", "未知资金源")
+        chip_source = self.bundle.sources.get("chips", "未知筹码源")
+        self.main_flow_card.subtitle_label.setText(
+            f"{self.main_flow_card.subtitle_label.text()}\n{flow_source}"
+        )
+        for card in (self.profit_ratio_card, self.average_cost_card, self.concentration_card):
+            card.subtitle_label.setText(f"{card.subtitle_label.text()}\n{chip_source}")
         latest_price = None
         if not self.indicator_frame.empty:
             latest_price = self._number(self.indicator_frame.iloc[-1].get("close"))
-        self.chip_distribution_chart.set_data(self.bundle.chips, latest_price)
         self.chip_detail_chart.set_data(self.bundle.chips, latest_price)
 
     def _populate_flow(self, frame: pd.DataFrame) -> None:
@@ -901,7 +1029,11 @@ class DetailPage(QWidget):
             self.company_status.setText("ETF和指数没有单一上市公司的股东、筹码、企业概况与财务报表。")
             self.financial_chart.set_data(pd.DataFrame())
             return
-        self.company_status.setText("已汇总资金、筹码、主要股东、企业资料和财务披露；可用下方导航切换。")
+        self.company_status.setText(
+            "已汇总资金、筹码、主要股东、企业资料和财务披露；"
+            f"资金：{self.bundle.sources.get('fund_flow', '未知')}；"
+            f"筹码：{self.bundle.sources.get('chips', '未知')}。"
+        )
         pairs: list[tuple[str, str]] = []
         frame = self.bundle.company_info
         if frame is not None and not frame.empty:
@@ -1101,6 +1233,9 @@ class DetailPage(QWidget):
             return
         self.formula_name.setText(indicator.name)
         self.formula_edit.setPlainText(indicator.formula)
+        category_index = self.formula_category.findText(indicator.category)
+        self.formula_category.setCurrentIndex(max(0, category_index))
+        self.formula_in_library.setChecked(indicator.in_library)
         self.formula_name.setProperty("indicator_id", indicator.id)
         self.delete_formula_button.setEnabled(True)
 
@@ -1108,6 +1243,8 @@ class DetailPage(QWidget):
         self.formula_list.clearSelection()
         self.formula_name.clear()
         self.formula_edit.clear()
+        self.formula_category.setCurrentText("趋势")
+        self.formula_in_library.setChecked(False)
         self.formula_name.setProperty("indicator_id", None)
         self.delete_formula_button.setEnabled(False)
         self.formula_status.setText("请输入名称和公式。")
@@ -1137,6 +1274,8 @@ class DetailPage(QWidget):
                 id=int(raw_id) if raw_id not in (None, "") else None,
                 name=self.formula_name.text().strip(),
                 formula=self.formula_edit.toPlainText().strip(),
+                category=self.formula_category.currentText(),
+                in_library=self.formula_in_library.isChecked(),
             )
             saved = self.repository.save_custom_indicator(indicator)
         except (FormulaError, ValueError, sqlite3.IntegrityError) as exc:
@@ -1145,6 +1284,9 @@ class DetailPage(QWidget):
             return
         self.formula_name.setProperty("indicator_id", saved.id)
         self._reload_formula_list(saved.id)
+        self._rebuild_indicator_library()
+        self._populate_indicators()
+        self._update_overview()
         self.formula_status.setStyleSheet("color:#6EE7B7;")
         self.formula_status.setText("已保存到本地数据库。")
 
@@ -1174,6 +1316,10 @@ class DetailPage(QWidget):
         self.repository.delete_custom_indicator(int(raw_id))
         self._new_formula()
         self._reload_formula_list()
+        self.indicator_favorites = self.repository.list_indicator_favorites()
+        self._rebuild_indicator_library()
+        self._populate_indicators()
+        self._update_overview()
 
     def _toggle_watchlist(self) -> None:
         if self.security is None:

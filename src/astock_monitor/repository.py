@@ -63,6 +63,11 @@ class Repository:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS indicator_favorites (
+                    indicator_key TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
             connection.execute(
@@ -73,6 +78,18 @@ class Repository:
             }
             if "group_id" not in columns:
                 connection.execute("ALTER TABLE watchlist ADD COLUMN group_id INTEGER")
+            custom_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(custom_indicators)").fetchall()
+            }
+            if "category" not in custom_columns:
+                connection.execute(
+                    "ALTER TABLE custom_indicators ADD COLUMN category TEXT NOT NULL DEFAULT '趋势'"
+                )
+            if "in_library" not in custom_columns:
+                connection.execute(
+                    "ALTER TABLE custom_indicators ADD COLUMN in_library INTEGER NOT NULL DEFAULT 0"
+                )
             default_group_id = self._default_group_id(connection)
             connection.execute(
                 "UPDATE watchlist SET group_id = ? WHERE group_id IS NULL", (default_group_id,)
@@ -100,8 +117,11 @@ class Repository:
             if formula_count == 0:
                 for item in DEFAULT_FORMULAS:
                     connection.execute(
-                        "INSERT OR IGNORE INTO custom_indicators (name, formula, color) VALUES (?, ?, ?)",
-                        (item.name, item.formula, item.color),
+                        """
+                        INSERT OR IGNORE INTO custom_indicators
+                        (name, formula, color, category, in_library) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (item.name, item.formula, item.color, item.category, int(item.in_library)),
                     )
 
     @staticmethod
@@ -305,10 +325,20 @@ class Repository:
     def list_custom_indicators(self) -> list[CustomIndicator]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id, name, formula, color FROM custom_indicators ORDER BY id"
+                """
+                SELECT id, name, formula, color, category, in_library
+                FROM custom_indicators ORDER BY id
+                """
             ).fetchall()
         return [
-            CustomIndicator(row["id"], row["name"], row["formula"], row["color"])
+            CustomIndicator(
+                row["id"],
+                row["name"],
+                row["formula"],
+                row["color"],
+                row["category"],
+                bool(row["in_library"]),
+            )
             for row in rows
         ]
 
@@ -317,24 +347,69 @@ class Repository:
         formula = indicator.formula.strip()
         if not name or not formula:
             raise ValueError("指标名称和公式不能为空")
+        if indicator.category not in {"趋势", "动量", "波动", "量能", "情绪", "风险"}:
+            raise ValueError("自定义指标必须归入六个指标维度之一")
         with self._connect() as connection:
             if indicator.id is None:
                 cursor = connection.execute(
-                    "INSERT INTO custom_indicators (name, formula, color) VALUES (?, ?, ?)",
-                    (name, formula, indicator.color),
+                    """
+                    INSERT INTO custom_indicators
+                    (name, formula, color, category, in_library) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        name,
+                        formula,
+                        indicator.color,
+                        indicator.category,
+                        int(indicator.in_library),
+                    ),
                 )
                 indicator.id = int(cursor.lastrowid)
             else:
                 connection.execute(
                     """
                     UPDATE custom_indicators
-                    SET name = ?, formula = ?, color = ?, updated_at = CURRENT_TIMESTAMP
+                    SET name = ?, formula = ?, color = ?, category = ?, in_library = ?,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (name, formula, indicator.color, indicator.id),
+                    (
+                        name,
+                        formula,
+                        indicator.color,
+                        indicator.category,
+                        int(indicator.in_library),
+                        indicator.id,
+                    ),
                 )
         return indicator
 
     def delete_custom_indicator(self, indicator_id: int) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM custom_indicators WHERE id = ?", (indicator_id,))
+            connection.execute(
+                "DELETE FROM indicator_favorites WHERE indicator_key = ?",
+                (f"custom:{indicator_id}",),
+            )
+
+    def list_indicator_favorites(self) -> set[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT indicator_key FROM indicator_favorites"
+            ).fetchall()
+        return {str(row["indicator_key"]) for row in rows}
+
+    def set_indicator_favorite(self, indicator_key: str, favorite: bool) -> None:
+        key = indicator_key.strip()
+        if not key:
+            raise ValueError("指标标识不能为空")
+        with self._connect() as connection:
+            if favorite:
+                connection.execute(
+                    "INSERT OR IGNORE INTO indicator_favorites (indicator_key) VALUES (?)",
+                    (key,),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM indicator_favorites WHERE indicator_key = ?", (key,)
+                )

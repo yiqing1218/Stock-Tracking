@@ -97,3 +97,5 @@ class CustomIndicator:
     name: str
     formula: str
     color: str = "#38BDF8"
+    category: str = "趋势"
+    in_library: bool = False

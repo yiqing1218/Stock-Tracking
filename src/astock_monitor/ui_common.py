@@ -30,6 +30,11 @@ QFrame#TopBar, QFrame#Section, QFrame#Card {
     border-radius: 10px;
 }
 QFrame#TopBar { border-radius: 0; border-left: 0; border-right: 0; border-top: 0; }
+QFrame#ChartControls {
+    background: rgba(8, 19, 33, 218);
+    border: 1px solid #2B4260;
+    border-radius: 8px;
+}
 QLabel#AppName { font-size: 18px; font-weight: 700; color: #F4F8FD; }
 QLabel#PageTitle { font-size: 22px; font-weight: 700; color: #F4F8FD; }
 QLabel#SecurityName { font-size: 24px; font-weight: 700; color: #F4F8FD; }
@@ -46,6 +51,10 @@ QLineEdit, QTextEdit, QComboBox, QSpinBox {
     selection-background-color: #0EA5E9;
 }
 QLineEdit:focus, QTextEdit:focus, QComboBox:focus { border: 1px solid #38BDF8; }
+QCheckBox { color: #AFC0D5; spacing: 7px; }
+QCheckBox::indicator { width: 16px; height: 16px; }
+QCheckBox::indicator:unchecked { border: 1px solid #3A587C; background: #0E1C30; border-radius: 3px; }
+QCheckBox::indicator:checked { border: 1px solid #38BDF8; background: #0284C7; border-radius: 3px; }
 QLineEdit#SearchBox { font-size: 14px; padding: 10px 14px; }
 QPushButton {
     background: #12233A;
@@ -75,6 +84,27 @@ QPushButton#SubNavigation:checked {
     color: #F4F8FD;
     border-color: #38BDF8;
 }
+QPushButton#ChartControl {
+    padding: 0;
+    font-size: 18px;
+    font-weight: 700;
+    background: #10243B;
+    border-color: #315071;
+}
+QPushButton#ChartControl:hover { background: #174064; border-color: #38BDF8; }
+QPushButton#FavoriteFilter:checked {
+    color: #FBBF24;
+    border-color: #D9A91A;
+    background: #2A230F;
+}
+QPushButton#FavoriteStar {
+    padding: 2px;
+    color: #71849D;
+    background: transparent;
+    border: 0;
+    font-size: 19px;
+}
+QPushButton#FavoriteStar:checked { color: #FBBF24; }
 QTableWidget, QTableView, QListWidget {
     background: #0A1525;
     alternate-background-color: #0C192B;

@@ -1,12 +1,69 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
+import warnings
 
 import numpy as np
 import pandas as pd
+import pandas_ta_classic as pta
 
 
 EPSILON = 1e-12
+INDICATOR_DIMENSIONS = ("趋势", "动量", "波动", "量能", "情绪", "风险")
+
+
+def resample_ohlcv(source: pd.DataFrame, period: str) -> pd.DataFrame:
+    """Aggregate daily OHLCV into live weekly or monthly candles."""
+
+    if period == "daily":
+        return source.copy().reset_index(drop=True)
+    rules = {"weekly": "W-FRI", "monthly": "ME"}
+    if period not in rules:
+        raise ValueError("K线周期只支持 daily、weekly、monthly")
+    if source is None or source.empty:
+        return pd.DataFrame()
+    frame = source.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame = frame.dropna(subset=["date"]).sort_values("date")
+    frame["_actual_date"] = frame["date"]
+    frame = frame.set_index("date")
+    aggregations: dict[str, str] = {
+        "_actual_date": "max",
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+    for column in ("amount", "turnover"):
+        if column in frame:
+            aggregations[column] = "sum"
+    result = frame.resample(rules[period]).agg(aggregations)
+    result = result.dropna(subset=["open", "high", "low", "close"])
+    result = result.rename(columns={"_actual_date": "date"}).reset_index(drop=True)
+    previous = result["close"].shift(1)
+    result["change"] = result["close"] - previous
+    result["pct_change"] = safe_div(result["change"], previous) * 100
+    result["amplitude"] = safe_div(result["high"] - result["low"], previous) * 100
+    for column in ("amount", "turnover"):
+        if column not in result:
+            result[column] = np.nan
+    return result[
+        [
+            "date",
+            "open",
+            "close",
+            "high",
+            "low",
+            "volume",
+            "amount",
+            "amplitude",
+            "pct_change",
+            "change",
+            "turnover",
+        ]
+    ]
 
 
 def sma(series: pd.Series, window: int) -> pd.Series:
@@ -129,7 +186,117 @@ def supertrend(frame: pd.DataFrame, window: int = 10, multiplier: float = 3.0) -
     return pd.Series(result, index=frame.index)
 
 
-def calculate_indicators(source: pd.DataFrame) -> pd.DataFrame:
+_PTA_DIMENSION_BY_CATEGORY = {
+    "candles": "情绪",
+    "cycles": "动量",
+    "momentum": "动量",
+    "overlap": "趋势",
+    "performance": "风险",
+    "statistics": "风险",
+    "trend": "趋势",
+    "volatility": "波动",
+    "volume": "量能",
+}
+
+_PTA_OUTPUT_ALIASES = {
+    "isa": "趋势",
+    "isb": "趋势",
+    "its": "趋势",
+    "iks": "趋势",
+    "ics": "趋势",
+    "dmp": "趋势",
+    "dmn": "趋势",
+    "vtxp": "趋势",
+    "vtxm": "趋势",
+    "ttmtrnd": "趋势",
+    "psarl": "趋势",
+    "psars": "趋势",
+    "psaraf": "趋势",
+    "psarr": "趋势",
+    "bbl": "波动",
+    "bbm": "波动",
+    "bbu": "波动",
+    "bbb": "波动",
+    "bbp": "波动",
+    "dcl": "波动",
+    "dcm": "波动",
+    "dcu": "波动",
+    "kcl": "波动",
+    "kcb": "波动",
+    "kcu": "波动",
+    "hwcl": "波动",
+    "hwcm": "波动",
+    "hwcu": "波动",
+    "sqz": "动量",
+    "sqzpro": "动量",
+    "cdl": "情绪",
+    "ha": "情绪",
+}
+
+
+def _normalized_indicator_name(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+
+def _extended_dimension(output_name: str) -> str:
+    normalized = _normalized_indicator_name(output_name)
+    for prefix, dimension in sorted(
+        _PTA_OUTPUT_ALIASES.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if normalized.startswith(prefix):
+            return dimension
+    candidates: list[tuple[int, str]] = []
+    for category, names in pta.Category.items():
+        dimension = _PTA_DIMENSION_BY_CATEGORY.get(category, "风险")
+        for name in names:
+            normalized_name = _normalized_indicator_name(name)
+            if normalized.startswith(normalized_name):
+                candidates.append((len(normalized_name), dimension))
+    return max(candidates, default=(0, "风险"))[1]
+
+
+def _calculate_extended_indicators(
+    source: pd.DataFrame,
+) -> tuple[pd.DataFrame, list["IndicatorDefinition"]]:
+    if source.empty:
+        return pd.DataFrame(index=source.index), []
+    base_columns = [column for column in ("open", "high", "low", "close", "volume") if column in source]
+    pta_frame = source.copy()
+    if "date" in pta_frame:
+        pta_frame.index = pd.to_datetime(pta_frame["date"], errors="coerce")
+    pta_frame = pta_frame[base_columns]
+    pta_frame.ta.cores = 0
+    original_count = len(pta_frame.columns)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pta_frame.ta.strategy()
+    generated = pta_frame.iloc[:, original_count:]
+    series_map: dict[str, pd.Series] = {}
+    definitions: list[IndicatorDefinition] = []
+    name_counts: dict[str, int] = {}
+    for position, raw_column in enumerate(generated.columns):
+        raw_name = str(raw_column)
+        numeric = pd.to_numeric(generated.iloc[:, position], errors="coerce").reset_index(drop=True)
+        if numeric.notna().sum() == 0:
+            continue
+        name_counts[raw_name] = name_counts.get(raw_name, 0) + 1
+        suffix = f"_{name_counts[raw_name]}" if name_counts[raw_name] > 1 else ""
+        column = f"PTA_{raw_name}{suffix}"
+        series_map[column] = numeric
+        definitions.append(
+            IndicatorDefinition(
+                _extended_dimension(raw_name),
+                raw_name + suffix,
+                column,
+                f"Pandas TA Classic 公开指标输出：{raw_name}",
+            )
+        )
+    return pd.DataFrame(series_map, index=source.index), definitions
+
+
+def calculate_indicators(
+    source: pd.DataFrame, include_extended: bool = False
+) -> pd.DataFrame:
     required = {"open", "close", "high", "low", "volume"}
     missing = required.difference(source.columns)
     if missing:
@@ -322,7 +489,16 @@ def calculate_indicators(source: pd.DataFrame) -> pd.DataFrame:
     bearish_engulf = (close < open_price) & (close.shift(1) > open_price.shift(1)) & (open_price >= close.shift(1)) & (close <= open_price.shift(1))
     frame["PATTERN_ENGULFING"] = bullish_engulf.astype(float) - bearish_engulf.astype(float)
 
-    return frame.replace([np.inf, -np.inf], np.nan)
+    frame = frame.replace([np.inf, -np.inf], np.nan)
+    extended_definitions: list[IndicatorDefinition] = []
+    if include_extended:
+        extended, extended_definitions = _calculate_extended_indicators(source.reset_index(drop=True))
+        duplicate_columns = [column for column in extended if column in frame]
+        if duplicate_columns:
+            extended = extended.drop(columns=duplicate_columns)
+        frame = pd.concat([frame.reset_index(drop=True), extended.reset_index(drop=True)], axis=1)
+    frame.attrs["extended_indicator_definitions"] = extended_definitions
+    return frame
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +508,12 @@ class IndicatorDefinition:
     column: str
     description: str
     unit: str = ""
+    origin: str = "系统"
+    key: str = ""
+
+    @property
+    def identifier(self) -> str:
+        return self.key or f"system:{self.column}"
 
 
 INDICATOR_CATALOG = [
@@ -477,35 +659,128 @@ def indicator_status(column: str, value: float | None, frame: pd.DataFrame) -> s
 
 
 def build_indicator_snapshot(frame: pd.DataFrame) -> list[IndicatorSnapshot]:
-    return [
-        IndicatorSnapshot(
-            definition=item,
-            value=_latest_number(frame, item.column),
-            status=indicator_status(item.column, _latest_number(frame, item.column), frame),
-        )
-        for item in INDICATOR_CATALOG
+    definitions = [
+        *INDICATOR_CATALOG,
+        *frame.attrs.get("extended_indicator_definitions", []),
+        *frame.attrs.get("custom_indicator_definitions", []),
     ]
+    return [indicator_snapshot(frame, item) for item in definitions]
+
+
+def indicator_snapshot(
+    frame: pd.DataFrame, definition: IndicatorDefinition
+) -> IndicatorSnapshot:
+    value = _latest_number(frame, definition.column)
+    return IndicatorSnapshot(
+        definition=definition,
+        value=value,
+        status=_definition_status(definition, value, frame),
+    )
+
+
+def _definition_status(
+    definition: IndicatorDefinition, value: float | None, frame: pd.DataFrame
+) -> str:
+    status = indicator_status(definition.column, value, frame)
+    if status != "—" or value is None:
+        return status
+    if definition.category == "趋势":
+        close = _latest_number(frame, "close")
+        if close is not None and 0.08 * close <= abs(value) <= 12 * close:
+            return "价在线上" if close >= value else "价在线下"
+        return "偏多" if value > 0 else "偏空" if value < 0 else "中性"
+    if definition.category in {"动量", "量能", "情绪"}:
+        return "偏多" if value > 0 else "偏空" if value < 0 else "中性"
+    if definition.category == "波动":
+        values = frame.get(definition.column, pd.Series(dtype=float)).dropna()
+        if len(values) >= 20:
+            rank = float(values.rank(pct=True).iloc[-1])
+            return "高波动" if rank >= 0.75 else "低波动" if rank <= 0.25 else "常态"
+        return "波动指标"
+    return "风险改善" if value > 0 else "风险偏高" if value < 0 else "中性"
+
+
+_POSITIVE_STATUS_WORDS = (
+    "偏多",
+    "多方",
+    "上涨",
+    "在线上",
+    "风险收益较优",
+    "风险改善",
+    "低波动",
+    "可控",
+    "明显放量",
+    "极强",
+    "偏热",
+)
+_NEGATIVE_STATUS_WORDS = (
+    "偏空",
+    "空方",
+    "下跌",
+    "在线下",
+    "风险收益偏弱",
+    "风险较高",
+    "风险偏高",
+    "高波动",
+    "缩量",
+    "极弱",
+    "偏冷",
+)
+
+
+def _snapshot_effect(snapshot: IndicatorSnapshot) -> float:
+    status = snapshot.status
+    if any(word in status for word in _POSITIVE_STATUS_WORDS):
+        return 1.0
+    if any(word in status for word in _NEGATIVE_STATUS_WORDS):
+        return -1.0
+    return 0.0
+
+
+def dimension_composites(
+    snapshots: list[IndicatorSnapshot],
+) -> dict[str, dict[str, float | int | str]]:
+    """Average every available indicator effect within each of six dimensions."""
+
+    result: dict[str, dict[str, float | int | str]] = {}
+    for dimension in INDICATOR_DIMENSIONS:
+        members = [
+            snapshot
+            for snapshot in snapshots
+            if snapshot.definition.category == dimension and snapshot.value is not None
+        ]
+        effects = [_snapshot_effect(snapshot) for snapshot in members]
+        score = float(np.clip((float(np.mean(effects)) + 1) * 50, 0, 100)) if effects else 50.0
+        if score >= 67:
+            status = "综合偏多"
+        elif score >= 56:
+            status = "综合略偏多"
+        elif score <= 33:
+            status = "综合偏空"
+        elif score <= 44:
+            status = "综合略偏空"
+        else:
+            status = "综合中性"
+        result[dimension] = {
+            "score": round(score, 2),
+            "status": status,
+            "count": len(members),
+        }
+    return result
 
 
 def market_regime(frame: pd.DataFrame) -> dict[str, str | float]:
     if frame.empty:
         return {"regime": "数据不足", "direction": "未知", "score": 0.0, "summary": "暂无行情数据"}
-    close = _latest_number(frame, "close")
-    ma20 = _latest_number(frame, "SMA_20")
-    ma60 = _latest_number(frame, "SMA_60")
     adx = _latest_number(frame, "ADX_14") or 0.0
-    macd = _latest_number(frame, "MACD_HIST") or 0.0
-    rsi14 = _latest_number(frame, "RSI_14") or 50.0
-    cmf = _latest_number(frame, "CMF_20") or 0.0
-    score = 50.0
-    if close is not None and ma20 is not None:
-        score += 12 if close > ma20 else -12
-    if ma20 is not None and ma60 is not None:
-        score += 12 if ma20 > ma60 else -12
-    score += 10 if macd > 0 else -10
-    score += max(-8, min(8, (rsi14 - 50) * 0.32))
-    score += 8 if cmf > 0 else -8
-    score = float(np.clip(score, 0, 100))
+    system_snapshots = [
+        snapshot
+        for snapshot in build_indicator_snapshot(frame)
+        if snapshot.definition.origin == "系统"
+    ]
+    composites = dimension_composites(system_snapshots)
+    scores = [float(item["score"]) for item in composites.values()]
+    score = float(np.mean(scores)) if scores else 50.0
     direction = "偏多" if score >= 60 else "偏空" if score <= 40 else "中性"
     regime = "趋势" if adx >= 25 else "趋势酝酿" if adx >= 20 else "震荡"
     summary = f"{regime}环境，综合状态{direction}。ADX {adx:.1f}，多维评分 {score:.0f}/100。"

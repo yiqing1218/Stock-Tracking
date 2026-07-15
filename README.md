@@ -38,6 +38,8 @@ python -m venv .venv
 - 支持自选分组；可选择加入目标分组，并通过“分组管理”新建、重命名或删除分组。
 - 双击行进入详情；右键菜单提供打开详情、上移、下移、移到分组和移除。
 - 展示最新价、涨跌幅、成交额、换手率、量比、PE、PB、总市值等公开字段。
+- 最新价、涨跌幅、涨跌额、成交额、换手率、量比、PE、PB、总市值和评分等数字列均可点击表头排序；缺失值固定排在末尾。
+- 新增“评分”列，与详情页基于全部系统指标形成的六维综合评分保持同一口径。
 - 表格直接显示本次行情实际采用的数据源，不再显示“详情/移除”按钮。
 - 行情每 60 秒后台刷新，网络请求不阻塞界面；首次完整证券列表同步后使用 24 小时缓存。
 
@@ -46,10 +48,10 @@ python -m venv .venv
 ### 行情走势
 
 - 红涨绿跌的日K、成交量、MA5/MA20、布林带和 MACD。
-- 3月、6月、1年、3年、全部区间；鼠标滚轮缩放K线。
+- 支持日K、周K、月K切换；鼠标滚轮或图内＋/－按钮缩放，←/→按钮和键盘左右方向键平移可见区间。
 - 日线自动合并北京时间当日实时报价；右侧可切换前复权、不复权和后复权。
-- 双击任意日K会直接进入该交易日的1分钟分时；右侧同步展示筹码成本分布图。
-- 趋势/震荡状态、综合多维评分、历史波动率、回撤与六维状态摘要。
+- 双击任意K线会直接进入对应交易日的1分钟分时；行情走势页不再显示筹码分布图。
+- 趋势/震荡状态、综合多维评分、历史波动率、回撤与六维状态摘要；六个维度会完整显示，每个维度都汇总该维度下所有可用指标，而不是挑选单一指标。
 
 ### 历史分时
 
@@ -60,7 +62,7 @@ python -m venv .venv
 
 ### 全部指标
 
-当前目录约 75 个指标，可按趋势、动量、波动、量能、情绪、风险筛选：
+内置手工指标目录之外，程序还会加载 Pandas TA Classic 的公开指标及多输出结果；历史数据充足时通常可展开为 400 多个系统指标条目，实际数量会随数据长度和库版本变化。所有条目统一归入趋势、动量、波动、量能、情绪、风险六个维度：
 
 - 趋势：MA/EMA/WMA、MACD、DMI/ADX、Aroon、SAR、Supertrend、一目均衡、BBI、DMA、线性斜率。
 - 动量：RSI、KDJ、Stochastic、Williams %R、ROC、MOM、CCI、CMO、TRIX、PPO、Ultimate Oscillator。
@@ -69,13 +71,15 @@ python -m venv .venv
 - A股常见情绪：BIAS、PSY、AR、BR、CR。
 - 风险：多周期收益、滚动夏普、历史 VaR、当前回撤、偏度、峰度。
 - K线形态：十字星、锤头、射击之星、看涨/看跌吞没。
+- 每个指标右侧都有收藏星标；点亮右上角星标后只显示已收藏指标，收藏状态保存在本地数据库。
+- 指标表新增“来源”列，直接标识“系统”或“自定义”。
 
 ### 资金、筹码与公司
 
 原“资金与筹码”和“公司与财务”已合并，在同一页面通过二级导航切换：主力资金、筹码分布、主要股东、企业概况、主营业务、财务信息。
 
-- 主力资金流：公开数据源按超大单、大单、中单、小单统计的资金净额与占比。
-- 筹码分布：获利比例、平均成本、70%/90%成本区间与集中度。
+- 主力资金流：优先读取东方财富个股资金流，再尝试东方财富全市场排行和同花顺资金流；公开源不可用时由本地 OHLCV 收盘位置模型估算，并明确标注“非逐笔主力”。
+- 筹码分布：优先读取东方财富筹码接口；不可用时用换手率衰减成本模型估算获利比例、平均成本、70%/90%成本区间与集中度，并在页面显示实际来源。
 - 主要股东：最新可用定期报告的股东名称、数量、比例、性质和披露日期。
 
 “主力资金流”是成交单大小的统计口径，不等于机构真实持仓；“主要股东”是定期披露口径，也不代表实时仓位。应用在页面中明确分开显示。
@@ -120,7 +124,7 @@ ZSCORE(returns, 20) + ZSCORE(volume, 20)
 IF(CROSS(SMA(close, 5), SMA(close, 20)), 1, 0)
 ```
 
-公式校验、保存和绘图都在详情页完成。
+公式校验、保存和绘图都在详情页完成。保存时可选择六个维度之一，并选择是否加入“全部指标”库；加入后会显示为“自定义”来源并参与对应维度的综合状态计算。
 
 ## 数据与计算口径
 
@@ -132,10 +136,10 @@ IF(CROSS(SMA(close, 5), SMA(close, 20)), 1, 0)
 - 分时接口：股票使用 `stock_zh_a_hist_min_em` / `stock_zh_a_minute`；ETF 使用 `fund_etf_hist_min_em` / `stock_zh_a_minute`；指数使用 `index_zh_a_hist_min_em` / `stock_zh_a_minute`。
 - 证券目录：`stock_info_a_code_name`、`fund_etf_spot_em`、`stock_zh_index_spot_em`。
 - 公司和财务：`stock_ipo_info`、`stock_individual_info_em`、`stock_profile_cninfo`、`stock_individual_basic_info_xq`、`stock_zyjs_ths`、`stock_financial_abstract_ths`、`stock_financial_analysis_indicator`。
-- 资金和持仓：`stock_individual_fund_flow`、`stock_cyq_em`、`stock_main_stock_holder`。
+- 资金和持仓：`stock_individual_fund_flow`、`stock_individual_fund_flow_rank`、`stock_fund_flow_individual`、本地 OHLCV 资金估算、`stock_cyq_em`、本地换手衰减筹码估算、`stock_main_stock_holder`。
 - 资讯：`stock_news_em` 加 Bing 新闻 RSS 搜索；不需要 API Key。
 - AkShare 接口定义与字段以 [AkShare 股票数据文档](https://akshare.akfamily.xyz/data/stock/stock.html) 和 [ETF 分时文档](https://akshare.akfamily.xyz/data/fund/fund_public.html) 为准。
-- 指标分类参考 [TA-Lib 官方函数目录](https://ta-lib.org/functions/)；实际公式由本项目用 pandas/numpy 实现。
+- 指标分类参考 [TA-Lib 官方函数目录](https://ta-lib.org/functions/)；扩展指标通过 [Pandas TA Classic](https://xgboosted.github.io/pandas-ta-classic/indicators.html) 计算，项目原有指标继续使用 pandas/numpy 实现。
 - 滚动均值、标准差和指数加权使用 [pandas Window API](https://pandas.pydata.org/pandas-docs/stable/reference/window.html)。
 - 日线默认前复权；指标基于 OHLCV、成交额、换手率等公开字段。
 - 所有“今天”、交易状态、缓存年龄和界面时间均统一按 `Asia/Shanghai` 北京时间计算，不受 Windows 当前时区影响。

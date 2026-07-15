@@ -30,12 +30,14 @@ class MarketChart(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(430)
         self._frame = pd.DataFrame()
         self._custom: pd.Series | None = None
         self._custom_name = "MACD"
         self._visible_count = 120
+        self._right_offset = 0
         self._hover_position: QPointF | None = None
         self._last_plot_rect = QRectF()
         self._visible_frame = pd.DataFrame()
@@ -53,25 +55,83 @@ class MarketChart(QWidget):
         self._custom = custom.reindex(frame.index) if custom is not None else None
         self._custom_name = custom_name
         self._visible_count = min(max(40, self._visible_count), max(40, len(frame)))
+        self._right_offset = 0
         self.update()
 
     def clear(self) -> None:
         self._frame = pd.DataFrame()
         self._custom = None
         self._visible_frame = pd.DataFrame()
+        self._right_offset = 0
+        self.update()
+
+    def zoom_in(self) -> None:
+        if self._frame.empty:
+            return
+        self._visible_count = int(
+            np.clip(self._visible_count - 10, 20, max(20, len(self._frame)))
+        )
+        self._right_offset = min(self._right_offset, self._maximum_offset())
+        self.update()
+
+    def zoom_out(self) -> None:
+        if self._frame.empty:
+            return
+        self._visible_count = int(
+            np.clip(self._visible_count + 10, 20, max(20, len(self._frame)))
+        )
+        self._right_offset = min(self._right_offset, self._maximum_offset())
+        self.update()
+
+    def _maximum_offset(self) -> int:
+        return max(0, len(self._frame) - min(self._visible_count, len(self._frame)))
+
+    def pan_left(self) -> None:
+        if self._frame.empty:
+            return
+        step = max(1, self._visible_count // 5)
+        self._right_offset = min(self._maximum_offset(), self._right_offset + step)
+        self.update()
+
+    def pan_right(self) -> None:
+        if self._frame.empty:
+            return
+        step = max(1, self._visible_count // 5)
+        self._right_offset = max(0, self._right_offset - step)
         self.update()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         if self._frame.empty:
             return
-        step = -10 if event.angleDelta().y() > 0 else 10
-        self._visible_count = int(np.clip(self._visible_count + step, 30, min(260, len(self._frame))))
-        self.update()
+        self.zoom_in() if event.angleDelta().y() > 0 else self.zoom_out()
         event.accept()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key() == Qt.Key.Key_Left:
+            self.pan_left()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Right:
+            self.pan_right()
+            event.accept()
+            return
+        if event.key() in {Qt.Key.Key_Plus, Qt.Key.Key_Equal}:
+            self.zoom_in()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Minus:
+            self.zoom_out()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         self._hover_position = event.position()
         self.update()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         if (
@@ -111,11 +171,13 @@ class MarketChart(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "正在加载行情图表…")
             return
 
-        visible = self._frame.tail(self._visible_count).reset_index(drop=True)
+        end = len(self._frame) - self._right_offset
+        start = max(0, end - self._visible_count)
+        visible = self._frame.iloc[start:end].reset_index(drop=True)
         self._visible_frame = visible
         custom = None
         if self._custom is not None:
-            custom = self._custom.tail(self._visible_count).reset_index(drop=True)
+            custom = self._custom.iloc[start:end].reset_index(drop=True)
 
         bounds = QRectF(self.rect()).adjusted(14, 12, -12, -12)
         painter.fillRect(bounds, COLORS["panel"])
