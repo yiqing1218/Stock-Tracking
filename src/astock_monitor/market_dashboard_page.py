@@ -5,6 +5,7 @@ from PySide6.QtCore import QThreadPool, QTimer, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QFrame,
+    QComboBox,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -34,6 +35,7 @@ from .ui_common import (
     format_percent,
     section_title,
 )
+from .watchlist_page import SortableTableWidgetItem
 
 
 class MarketDashboardPage(QWidget):
@@ -50,6 +52,7 @@ class MarketDashboardPage(QWidget):
         self.thread_pool = thread_pool
         self._running = False
         self._active_workers: set[Worker] = set()
+        self._boards = pd.DataFrame()
         self._build_ui()
         self.timer = QTimer(self)
         self.timer.setInterval(60_000)
@@ -67,7 +70,7 @@ class MarketDashboardPage(QWidget):
         title_group = QVBoxLayout()
         title = QLabel("A股大盘监看")
         title.setObjectName("SecurityName")
-        subtitle = QLabel("核心指数 · 市场宽度 · 领涨行业 · 强弱个股")
+        subtitle = QLabel("当前交易日 · 核心指数 · 市场宽度 · 全部板块 · 强弱个股")
         subtitle.setObjectName("Muted")
         title_group.addWidget(title)
         title_group.addWidget(subtitle)
@@ -82,7 +85,9 @@ class MarketDashboardPage(QWidget):
         header_layout.addWidget(self.refresh_button)
         root.addWidget(header)
 
-        root.addWidget(section_title("核心指数", "指数快照独立回退，不因单一数据源失败而整页空白"))
+        root.addWidget(
+            section_title("核心指数", "指数快照独立回退，不因单一数据源失败而整页空白")
+        )
         index_grid = QGridLayout()
         index_grid.setHorizontalSpacing(9)
         index_grid.setVerticalSpacing(9)
@@ -95,7 +100,9 @@ class MarketDashboardPage(QWidget):
         root.addLayout(index_grid)
 
         breadth_header = QHBoxLayout()
-        breadth_header.addWidget(section_title("市场宽度", "全A涨跌家数比单一指数更能反映普遍强弱"))
+        breadth_header.addWidget(
+            section_title("市场宽度", "全A涨跌家数比单一指数更能反映普遍强弱")
+        )
         breadth_header.addStretch(1)
         self.source_label = QLabel("数据源：—")
         self.source_label.setObjectName("Tiny")
@@ -106,8 +113,8 @@ class MarketDashboardPage(QWidget):
         self.breadth_cards = {
             "up": MetricCard("上涨家数"),
             "down": MetricCard("下跌家数"),
-            "limit_up": MetricCard("涨停近似"),
-            "limit_down": MetricCard("跌停近似"),
+            "limit_up": MetricCard("涨停家数"),
+            "limit_down": MetricCard("跌停家数"),
             "median_change": MetricCard("全A中位涨幅"),
             "amount": MetricCard("全A成交额"),
         }
@@ -117,16 +124,42 @@ class MarketDashboardPage(QWidget):
         root.addLayout(breadth_layout)
 
         lower = QSplitter(Qt.Orientation.Horizontal)
-        sectors_panel = QFrame()
-        sectors_panel.setObjectName("Section")
-        sectors_layout = QVBoxLayout(sectors_panel)
-        sectors_layout.addWidget(section_title("领涨行业", "按当前板块涨跌幅排序"))
-        self.sector_table = QTableWidget(0, 4)
-        self.sector_table.setHorizontalHeaderLabels(["行业", "涨跌幅", "领涨股", "领涨股涨跌幅"])
-        configure_table(self.sector_table)
-        self.sector_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        sectors_layout.addWidget(self.sector_table)
-        lower.addWidget(sectors_panel)
+        boards_panel = QFrame()
+        boards_panel.setObjectName("Section")
+        boards_layout = QVBoxLayout(boards_panel)
+        board_header = QHBoxLayout()
+        board_header.addWidget(
+            section_title("A股板块", "行业与概念板块完整涨跌列表，不展示个股")
+        )
+        board_header.addStretch(1)
+        self.board_filter = QComboBox()
+        self.board_filter.addItems(["全部板块", "行业", "概念"])
+        self.board_filter.currentTextChanged.connect(self._filter_boards)
+        board_header.addWidget(self.board_filter)
+        boards_layout.addLayout(board_header)
+        self.board_table = QTableWidget(0, 8)
+        self.board_table.setHorizontalHeaderLabels(
+            [
+                "类型",
+                "板块",
+                "涨跌幅",
+                "板块指数",
+                "换手率",
+                "上涨家数",
+                "下跌家数",
+                "总市值",
+            ]
+        )
+        configure_table(self.board_table)
+        self.board_table.setSortingEnabled(True)
+        board_table_header = self.board_table.horizontalHeader()
+        board_table_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for index in (0, 2, 3, 4, 5, 6, 7):
+            board_table_header.setSectionResizeMode(
+                index, QHeaderView.ResizeMode.ResizeToContents
+            )
+        boards_layout.addWidget(self.board_table)
+        lower.addWidget(boards_panel)
 
         movers_panel = QFrame()
         movers_panel.setObjectName("Section")
@@ -137,12 +170,12 @@ class MarketDashboardPage(QWidget):
         movers_layout.addWidget(self.gainer_table)
         movers_layout.addWidget(self.loser_table)
         lower.addWidget(movers_panel)
-        lower.setStretchFactor(0, 4)
-        lower.setStretchFactor(1, 6)
+        lower.setStretchFactor(0, 6)
+        lower.setStretchFactor(1, 4)
         root.addWidget(lower, 1)
 
         note = QLabel(
-            "涨跌停家数按涨跌幅绝对值 9.5% 近似统计；不同板块实际涨跌停限制可能为 5%、10%、20% 或 30%。"
+            "涨跌停家数按证券名称、代码板块、昨收价和交易所价格取整规则逐只计算；上市初期无涨跌幅限制证券不计入涨跌停。"
         )
         note.setObjectName("Tiny")
         note.setWordWrap(True)
@@ -173,12 +206,14 @@ class MarketDashboardPage(QWidget):
         self._running = True
         self.refresh_button.setEnabled(False)
         self.refresh_button.setText("刷新中…")
-        self.status_label.setText("正在并行加载指数、全A快照和行业板块…")
+        self.status_label.setText("正在并行加载指数、当前交易日全A快照和全部板块…")
         worker = Worker(self.provider.get_market_dashboard)
         self._active_workers.add(worker)
         worker.signals.result.connect(self._on_loaded)
         worker.signals.error.connect(self._on_error)
-        worker.signals.finished.connect(lambda current=worker: self._active_workers.discard(current))
+        worker.signals.finished.connect(
+            lambda current=worker: self._active_workers.discard(current)
+        )
         worker.signals.finished.connect(self._finish)
         self.thread_pool.start(worker)
 
@@ -199,10 +234,18 @@ class MarketDashboardPage(QWidget):
             )
 
         breadth = result.breadth
-        self.breadth_cards["up"].set_value(str(int(breadth.get("up", 0))), "家", UP_COLOR)
-        self.breadth_cards["down"].set_value(str(int(breadth.get("down", 0))), "家", DOWN_COLOR)
-        self.breadth_cards["limit_up"].set_value(str(int(breadth.get("limit_up", 0))), "近似统计", UP_COLOR)
-        self.breadth_cards["limit_down"].set_value(str(int(breadth.get("limit_down", 0))), "近似统计", DOWN_COLOR)
+        self.breadth_cards["up"].set_value(
+            str(int(breadth.get("up", 0))), "家", UP_COLOR
+        )
+        self.breadth_cards["down"].set_value(
+            str(int(breadth.get("down", 0))), "家", DOWN_COLOR
+        )
+        self.breadth_cards["limit_up"].set_value(
+            str(int(breadth.get("limit_up", 0))), "逐只按涨停价统计", UP_COLOR
+        )
+        self.breadth_cards["limit_down"].set_value(
+            str(int(breadth.get("limit_down", 0))), "逐只按跌停价统计", DOWN_COLOR
+        )
         median = float(breadth.get("median_change", 0.0))
         self.breadth_cards["median_change"].set_value(
             format_percent(median), "中位数", change_color(median)
@@ -211,32 +254,75 @@ class MarketDashboardPage(QWidget):
             format_number(float(breadth.get("amount", 0.0))), "沪深京合计"
         )
 
-        self._fill_sectors(result.sectors)
+        self._boards = result.boards.copy()
+        self._filter_boards()
         self._fill_movers(self.gainer_table, result.gainers)
         self._fill_movers(self.loser_table, result.losers)
         now = beijing_now()
         warning = f" · {len(result.warnings)} 个数据源回退" if result.warnings else ""
-        self.status_label.setText(f"北京时间 {now:%Y-%m-%d %H:%M:%S} 更新{warning}")
-        sources = [result.sources.get("breadth"), result.sources.get("sectors")]
-        self.source_label.setText("数据源：" + "；".join(item for item in sources if item))
+        trade_date = (
+            f" · 当前交易日 {result.trade_date:%Y-%m-%d}" if result.trade_date else ""
+        )
+        self.status_label.setText(
+            f"北京时间 {now:%Y-%m-%d %H:%M:%S} 更新{trade_date}{warning}"
+        )
+        sources = [result.sources.get("breadth"), result.sources.get("boards")]
+        self.source_label.setText(
+            "数据源：" + "；".join(item for item in sources if item)
+        )
 
-    def _fill_sectors(self, frame: pd.DataFrame) -> None:
-        self.sector_table.setRowCount(len(frame))
+    def _filter_boards(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        selected = self.board_filter.currentText()
+        frame = self._boards
+        if selected in {"行业", "概念"} and not frame.empty and "类型" in frame:
+            frame = frame[frame["类型"] == selected]
+        self._fill_boards(frame)
+
+    def _fill_boards(self, frame: pd.DataFrame) -> None:
+        self.board_table.setSortingEnabled(False)
+        self.board_table.setRowCount(len(frame))
         for row_index, (_, row) in enumerate(frame.iterrows()):
             change = self._number(row.get("涨跌幅"))
-            leader_change = self._number(row.get("领涨股涨跌幅"))
-            values = [
-                str(row.get("行业", "—")),
-                format_percent(change),
-                str(row.get("领涨股", "—")),
-                format_percent(leader_change),
+            raw_values = [
+                (str(row.get("类型", "—")), None),
+                (str(row.get("板块名称", "—")), None),
+                (format_percent(change), change),
+                (
+                    format_number(self._number(row.get("最新价"))),
+                    self._number(row.get("最新价")),
+                ),
+                (
+                    format_percent(self._number(row.get("换手率")), signed=False),
+                    self._number(row.get("换手率")),
+                ),
+                (
+                    format_number(self._number(row.get("上涨家数")), decimals=0),
+                    self._number(row.get("上涨家数")),
+                ),
+                (
+                    format_number(self._number(row.get("下跌家数")), decimals=0),
+                    self._number(row.get("下跌家数")),
+                ),
+                (
+                    format_number(self._number(row.get("总市值"))),
+                    self._number(row.get("总市值")),
+                ),
             ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column in {1, 3}:
-                    item.setForeground(QColor(change_color(change if column == 1 else leader_change)))
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                self.sector_table.setItem(row_index, column, item)
+            for column, (text, numeric) in enumerate(raw_values):
+                item = (
+                    SortableTableWidgetItem(text, numeric)
+                    if numeric is not None
+                    else QTableWidgetItem(text)
+                )
+                if column == 2:
+                    item.setForeground(QColor(change_color(change)))
+                if column >= 2:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+                self.board_table.setItem(row_index, column, item)
+        self.board_table.setSortingEnabled(True)
+        self.board_table.sortItems(2, Qt.SortOrder.DescendingOrder)
 
     def _fill_movers(self, table: QTableWidget, frame: pd.DataFrame) -> None:
         table.setRowCount(len(frame))
@@ -252,7 +338,9 @@ class MarketDashboardPage(QWidget):
                 if column == 2:
                     item.setForeground(QColor(change_color(change)))
                 if column > 0:
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
                 table.setItem(row_index, column, item)
 
     def _on_error(self, message: str) -> None:

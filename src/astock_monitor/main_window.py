@@ -17,8 +17,11 @@ from PySide6.QtWidgets import (
 from .data_provider import DataProvider
 from .detail_page import DetailPage
 from .market_dashboard_page import MarketDashboardPage
+from .alerts import MessagePage
 from .models import Security
 from .repository import Repository
+from .screening_page import ScreeningPage
+from .strategy_page import StrategyBacktestPage
 from .watchlist_page import WatchlistPage
 
 
@@ -54,9 +57,10 @@ class MainWindow(QMainWindow):
         self.navigation_buttons: dict[str, QPushButton] = {}
         for key, label in (
             ("market", "大盘监看"),
+            ("screener", "条件荐股"),
             ("watchlist", "自选股票"),
             ("detail", "股票详情"),
-            ("strategy", "量化策略"),
+            ("strategy", "量化策略与回测"),
             ("alerts", "消息提示"),
         ):
             button = QPushButton(label)
@@ -76,24 +80,23 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.market_page = MarketDashboardPage(provider, self.thread_pool)
+        self.screening_page = ScreeningPage(repository, provider, self.thread_pool)
         self.watchlist_page = WatchlistPage(repository, provider, self.thread_pool)
         self.detail_page = DetailPage(repository, provider, self.thread_pool)
-        self.strategy_page = self._placeholder_page(
-            "量化策略",
-            "策略编排、回测与信号管理将在这里提供；当前版本先保留完整页面入口。",
+        self.strategy_page = StrategyBacktestPage(
+            repository, provider, self.thread_pool
         )
-        self.alerts_page = self._placeholder_page(
-            "消息提示",
-            "价格、指标、资金与资讯提醒将在这里统一管理；当前版本先保留完整页面入口。",
-        )
+        self.alerts_page = MessagePage(repository, provider, self.thread_pool)
         self.pages = {
             "market": self.market_page,
+            "screener": self.screening_page,
             "watchlist": self.watchlist_page,
             "detail": self.detail_page,
             "strategy": self.strategy_page,
             "alerts": self.alerts_page,
         }
         self.stack.addWidget(self.market_page)
+        self.stack.addWidget(self.screening_page)
         self.stack.addWidget(self.watchlist_page)
         self.stack.addWidget(self.detail_page)
         self.stack.addWidget(self.strategy_page)
@@ -104,10 +107,12 @@ class MainWindow(QMainWindow):
         self.watchlist_page.open_security.connect(self.open_detail)
         self.detail_page.back_requested.connect(self.show_watchlist)
         self.detail_page.watchlist_changed.connect(self.watchlist_page.start)
+        self.alerts_page.unread_count_changed.connect(self._update_unread_count)
         self._restore_geometry()
 
     def start(self) -> None:
         self.show_page("market")
+        self.alerts_page.start()
 
     def open_detail(self, security: Security) -> None:
         if not self.repository.contains_security(security):
@@ -141,8 +146,16 @@ class MainWindow(QMainWindow):
         self._set_navigation(key)
         if key == "market":
             self.market_page.start()
+        elif key == "screener":
+            self.screening_page.start()
         elif key == "watchlist":
             self.watchlist_page.start()
+        elif key == "alerts":
+            self.alerts_page.start()
+
+    def _update_unread_count(self, count: int) -> None:
+        label = "消息提示" if count <= 0 else f"消息提示 ({count})"
+        self.navigation_buttons["alerts"].setText(label)
 
     def _set_navigation(self, key: str) -> None:
         for name, button in self.navigation_buttons.items():
@@ -178,5 +191,6 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.alerts_page.stop()
         QSettings().setValue("window/geometry", self.saveGeometry())
         super().closeEvent(event)

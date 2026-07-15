@@ -118,7 +118,9 @@ def rolling_mad(series: pd.Series, window: int) -> pd.Series:
     )
 
 
-def parabolic_sar(frame: pd.DataFrame, step: float = 0.02, maximum: float = 0.2) -> pd.Series:
+def parabolic_sar(
+    frame: pd.DataFrame, step: float = 0.02, maximum: float = 0.2
+) -> pd.Series:
     if frame.empty:
         return pd.Series(dtype=float, index=frame.index)
     high = frame["high"].to_numpy(dtype=float)
@@ -163,7 +165,9 @@ def parabolic_sar(frame: pd.DataFrame, step: float = 0.02, maximum: float = 0.2)
     return pd.Series(values, index=frame.index)
 
 
-def supertrend(frame: pd.DataFrame, window: int = 10, multiplier: float = 3.0) -> pd.Series:
+def supertrend(
+    frame: pd.DataFrame, window: int = 10, multiplier: float = 3.0
+) -> pd.Series:
     atr = wilder(true_range(frame), window)
     middle = (frame["high"] + frame["low"]) / 2
     upper = (middle + multiplier * atr).to_numpy(dtype=float).copy()
@@ -260,7 +264,11 @@ def _calculate_extended_indicators(
 ) -> tuple[pd.DataFrame, list["IndicatorDefinition"]]:
     if source.empty:
         return pd.DataFrame(index=source.index), []
-    base_columns = [column for column in ("open", "high", "low", "close", "volume") if column in source]
+    base_columns = [
+        column
+        for column in ("open", "high", "low", "close", "volume")
+        if column in source
+    ]
     pta_frame = source.copy()
     if "date" in pta_frame:
         pta_frame.index = pd.to_datetime(pta_frame["date"], errors="coerce")
@@ -282,7 +290,9 @@ def _calculate_extended_indicators(
     name_counts: dict[str, int] = {}
     for position, raw_column in enumerate(generated.columns):
         raw_name = str(raw_column)
-        numeric = pd.to_numeric(generated.iloc[:, position], errors="coerce").reset_index(drop=True)
+        numeric = pd.to_numeric(
+            generated.iloc[:, position], errors="coerce"
+        ).reset_index(drop=True)
         if numeric.notna().sum() == 0:
             continue
         name_counts[raw_name] = name_counts.get(raw_name, 0) + 1
@@ -298,6 +308,134 @@ def _calculate_extended_indicators(
             )
         )
     return pd.DataFrame(series_map, index=source.index), definitions
+
+
+def build_screening_catalog() -> list["IndicatorDefinition"]:
+    """Build the same 480-item catalog used by the detail page without network data."""
+    size = 320
+    x = np.arange(size, dtype=float)
+    close = 10 + x * 0.015 + np.sin(x / 11)
+    sample = pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=size),
+            "open": close - 0.08,
+            "high": close + 0.25,
+            "low": close - 0.25,
+            "close": close,
+            "volume": 100_000 + x * 50,
+            "amount": close * (100_000 + x * 50),
+            "turnover": 1.0,
+        }
+    )
+    calculated = calculate_indicators(sample, include_extended=True)
+    definitions = [
+        *INDICATOR_CATALOG,
+        *calculated.attrs.get("extended_indicator_definitions", []),
+    ]
+    # The details library contains 479 calculated outputs on the bundled TA version;
+    # latest price is a useful first-class screening variable and makes 480.
+    close_definition = IndicatorDefinition(
+        "趋势", "最新收盘价", "close", "当前最新收盘价", "元"
+    )
+    unique: dict[str, IndicatorDefinition] = {close_definition.column: close_definition}
+    unique.update({item.column: item for item in definitions})
+    return list(unique.values())
+
+
+def calculate_selected_indicators(
+    source: pd.DataFrame, definitions: list["IndicatorDefinition"]
+) -> dict[str, float | None]:
+    """Calculate only requested outputs; avoids the 480-column all-market matrix."""
+    if not definitions:
+        return {}
+    manual_columns = {item.column for item in INDICATOR_CATALOG} | {"close"}
+    manual = [item for item in definitions if item.column in manual_columns]
+    extended = [item for item in definitions if item.column.startswith("PTA_")]
+    frame = (
+        calculate_indicators(source, include_extended=False)
+        if manual
+        else source.copy()
+    )
+    values: dict[str, float | None] = {}
+    for item in manual:
+        values[item.column] = _latest_number(frame, item.column)
+
+    if extended:
+        base_columns = [
+            name
+            for name in ("open", "high", "low", "close", "volume")
+            if name in source
+        ]
+        ta_frame = source[base_columns].copy()
+        accessor = ta_frame.ta
+        accessor.cores = 0
+        methods: dict[str, list[IndicatorDefinition]] = {}
+        available = {
+            name
+            for names in pta.Category.values()
+            for name in names
+            if hasattr(accessor, name)
+        }
+        for item in extended:
+            raw = item.name
+            normalized = _normalized_indicator_name(raw)
+            candidates = [
+                name
+                for name in available
+                if normalized.startswith(_normalized_indicator_name(name))
+            ]
+            if candidates:
+                method = max(
+                    candidates, key=lambda name: len(_normalized_indicator_name(name))
+                )
+                methods.setdefault(method, []).append(item)
+            else:
+                values[item.column] = None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for method in methods:
+                try:
+                    getattr(accessor, method)(append=True)
+                except Exception:
+                    continue
+        generated_columns = list(ta_frame.columns[len(base_columns) :])
+        normalized_outputs = [
+            (_normalized_indicator_name(name), name) for name in generated_columns
+        ]
+        for items in methods.values():
+            for item in items:
+                raw = item.name
+                target = _normalized_indicator_name(raw)
+                matches = [
+                    name
+                    for normalized, name in normalized_outputs
+                    if normalized == target
+                ]
+                if not matches:
+                    duplicate_target = _normalized_indicator_name(
+                        re.sub(r"_(?:[2-9]|[1-9]\d+)$", "", raw)
+                    )
+                    matches = [
+                        name
+                        for normalized, name in normalized_outputs
+                        if normalized == duplicate_target
+                    ]
+                if not matches:
+                    matches = [
+                        name
+                        for normalized, name in normalized_outputs
+                        if normalized.startswith(target)
+                    ]
+                if matches:
+                    series = pd.to_numeric(
+                        ta_frame[matches[0]], errors="coerce"
+                    ).dropna()
+                    values[item.column] = (
+                        float(series.iloc[-1]) if not series.empty else None
+                    )
+                else:
+                    values[item.column] = None
+    return values
 
 
 def calculate_indicators(
@@ -345,14 +483,21 @@ def calculate_indicators(
 
     upward = high.diff()
     downward = -low.diff()
-    plus_dm = pd.Series(np.where((upward > downward) & (upward > 0), upward, 0.0), index=frame.index)
-    minus_dm = pd.Series(np.where((downward > upward) & (downward > 0), downward, 0.0), index=frame.index)
+    plus_dm = pd.Series(
+        np.where((upward > downward) & (upward > 0), upward, 0.0), index=frame.index
+    )
+    minus_dm = pd.Series(
+        np.where((downward > upward) & (downward > 0), downward, 0.0), index=frame.index
+    )
     frame["PLUS_DI_14"] = safe_div(wilder(plus_dm, 14), frame["ATR_14"]) * 100
     frame["MINUS_DI_14"] = safe_div(wilder(minus_dm, 14), frame["ATR_14"]) * 100
-    dx = safe_div(
-        (frame["PLUS_DI_14"] - frame["MINUS_DI_14"]).abs(),
-        frame["PLUS_DI_14"] + frame["MINUS_DI_14"],
-    ) * 100
+    dx = (
+        safe_div(
+            (frame["PLUS_DI_14"] - frame["MINUS_DI_14"]).abs(),
+            frame["PLUS_DI_14"] + frame["MINUS_DI_14"],
+        )
+        * 100
+    )
     frame["ADX_14"] = wilder(dx, 14)
 
     aroon_window = 25
@@ -391,13 +536,23 @@ def calculate_indicators(
     frame["KDJ_K"] = rsv.ewm(alpha=1 / 3, adjust=False).mean()
     frame["KDJ_D"] = frame["KDJ_K"].ewm(alpha=1 / 3, adjust=False).mean()
     frame["KDJ_J"] = 3 * frame["KDJ_K"] - 2 * frame["KDJ_D"]
-    frame["STOCH_K_14"] = safe_div(close - low.rolling(14).min(), high.rolling(14).max() - low.rolling(14).min()) * 100
+    frame["STOCH_K_14"] = (
+        safe_div(
+            close - low.rolling(14).min(),
+            high.rolling(14).max() - low.rolling(14).min(),
+        )
+        * 100
+    )
     frame["STOCH_D_3"] = sma(frame["STOCH_K_14"], 3)
-    frame["WILLR_14"] = -100 * safe_div(high.rolling(14).max() - close, high.rolling(14).max() - low.rolling(14).min())
+    frame["WILLR_14"] = -100 * safe_div(
+        high.rolling(14).max() - close, high.rolling(14).max() - low.rolling(14).min()
+    )
     frame["ROC_12"] = close.pct_change(12, fill_method=None) * 100
     frame["MOM_10"] = close - close.shift(10)
     typical = (high + low + close) / 3
-    frame["CCI_20"] = safe_div(typical - sma(typical, 20), 0.015 * rolling_mad(typical, 20))
+    frame["CCI_20"] = safe_div(
+        typical - sma(typical, 20), 0.015 * rolling_mad(typical, 20)
+    )
     gains = close.diff().clip(lower=0).rolling(14).sum()
     losses = (-close.diff().clip(upper=0)).rolling(14).sum()
     frame["CMO_14"] = safe_div(gains - losses, gains + losses) * 100
@@ -407,10 +562,18 @@ def calculate_indicators(
     frame["PPO"] = safe_div(frame["EMA_12"] - frame["EMA_26"], frame["EMA_26"]) * 100
     frame["PPO_SIGNAL"] = ema(frame["PPO"], 9)
     buying_pressure = close - pd.concat([low, close.shift(1)], axis=1).min(axis=1)
-    true_range_uo = pd.concat([high, close.shift(1)], axis=1).max(axis=1) - pd.concat([low, close.shift(1)], axis=1).min(axis=1)
-    average_7 = safe_div(buying_pressure.rolling(7).sum(), true_range_uo.rolling(7).sum())
-    average_14 = safe_div(buying_pressure.rolling(14).sum(), true_range_uo.rolling(14).sum())
-    average_28 = safe_div(buying_pressure.rolling(28).sum(), true_range_uo.rolling(28).sum())
+    true_range_uo = pd.concat([high, close.shift(1)], axis=1).max(axis=1) - pd.concat(
+        [low, close.shift(1)], axis=1
+    ).min(axis=1)
+    average_7 = safe_div(
+        buying_pressure.rolling(7).sum(), true_range_uo.rolling(7).sum()
+    )
+    average_14 = safe_div(
+        buying_pressure.rolling(14).sum(), true_range_uo.rolling(14).sum()
+    )
+    average_28 = safe_div(
+        buying_pressure.rolling(28).sum(), true_range_uo.rolling(28).sum()
+    )
     frame["ULTOSC"] = 100 * (4 * average_7 + 2 * average_14 + average_28) / 7
     frame["PSY_12"] = (close.diff() > 0).rolling(12).mean() * 100
     frame["DPO_20"] = close.shift(11) - sma(close, 20)
@@ -420,8 +583,12 @@ def calculate_indicators(
     bb_std = close.rolling(20).std(ddof=0)
     frame["BB_UPPER"] = frame["BB_MID"] + 2 * bb_std
     frame["BB_LOWER"] = frame["BB_MID"] - 2 * bb_std
-    frame["BB_WIDTH"] = safe_div(frame["BB_UPPER"] - frame["BB_LOWER"], frame["BB_MID"]) * 100
-    frame["BB_PERCENT_B"] = safe_div(close - frame["BB_LOWER"], frame["BB_UPPER"] - frame["BB_LOWER"]) * 100
+    frame["BB_WIDTH"] = (
+        safe_div(frame["BB_UPPER"] - frame["BB_LOWER"], frame["BB_MID"]) * 100
+    )
+    frame["BB_PERCENT_B"] = (
+        safe_div(close - frame["BB_LOWER"], frame["BB_UPPER"] - frame["BB_LOWER"]) * 100
+    )
     frame["HV_20"] = log_returns.rolling(20).std(ddof=0) * np.sqrt(252) * 100
     frame["KELTNER_MID"] = ema(close, 20)
     frame["KELTNER_UPPER"] = frame["KELTNER_MID"] + 2 * frame["ATR_14"]
@@ -436,14 +603,20 @@ def calculate_indicators(
     # 成交量与资金行为
     direction = np.sign(close.diff()).fillna(0)
     frame["OBV"] = (direction * volume).cumsum()
-    money_flow_multiplier = safe_div((close - low) - (high - close), high - low).fillna(0)
+    money_flow_multiplier = safe_div((close - low) - (high - close), high - low).fillna(
+        0
+    )
     frame["ADL"] = (money_flow_multiplier * volume).cumsum()
-    frame["CMF_20"] = safe_div((money_flow_multiplier * volume).rolling(20).sum(), volume.rolling(20).sum())
+    frame["CMF_20"] = safe_div(
+        (money_flow_multiplier * volume).rolling(20).sum(), volume.rolling(20).sum()
+    )
     frame["CHAIKIN_OSC"] = ema(frame["ADL"], 3) - ema(frame["ADL"], 10)
     raw_money_flow = typical * volume
     positive_flow = raw_money_flow.where(typical.diff() > 0, 0.0)
     negative_flow = raw_money_flow.where(typical.diff() < 0, 0.0)
-    money_ratio = safe_div(positive_flow.rolling(14).sum(), negative_flow.rolling(14).sum())
+    money_ratio = safe_div(
+        positive_flow.rolling(14).sum(), negative_flow.rolling(14).sum()
+    )
     frame["MFI_14"] = 100 - 100 / (1 + money_ratio)
     frame["PVT"] = (returns.fillna(0) * volume).cumsum()
     frame["FORCE_13"] = ema(close.diff() * volume, 13)
@@ -455,28 +628,41 @@ def calculate_indicators(
     frame["VOLUME_RATIO_5"] = safe_div(volume, sma(volume.shift(1), 5))
     estimated_vwap = safe_div(amount, volume * 100)
     fallback_vwap = safe_div((typical * volume).cumsum(), volume.cumsum())
-    frame["VWAP"] = estimated_vwap.where(estimated_vwap.notna() & (estimated_vwap > 0), fallback_vwap)
+    frame["VWAP"] = estimated_vwap.where(
+        estimated_vwap.notna() & (estimated_vwap > 0), fallback_vwap
+    )
 
     # 中国市场常见人气/买卖意愿指标
     previous_close = close.shift(1)
-    frame["AR_26"] = safe_div(
-        (high - open_price).rolling(26).sum(),
-        (open_price - low).rolling(26).sum(),
-    ) * 100
-    frame["BR_26"] = safe_div(
-        (high - previous_close).clip(lower=0).rolling(26).sum(),
-        (previous_close - low).clip(lower=0).rolling(26).sum(),
-    ) * 100
-    frame["CR_26"] = safe_div(
-        (high - typical.shift(1)).clip(lower=0).rolling(26).sum(),
-        (typical.shift(1) - low).clip(lower=0).rolling(26).sum(),
-    ) * 100
+    frame["AR_26"] = (
+        safe_div(
+            (high - open_price).rolling(26).sum(),
+            (open_price - low).rolling(26).sum(),
+        )
+        * 100
+    )
+    frame["BR_26"] = (
+        safe_div(
+            (high - previous_close).clip(lower=0).rolling(26).sum(),
+            (previous_close - low).clip(lower=0).rolling(26).sum(),
+        )
+        * 100
+    )
+    frame["CR_26"] = (
+        safe_div(
+            (high - typical.shift(1)).clip(lower=0).rolling(26).sum(),
+            (typical.shift(1) - low).clip(lower=0).rolling(26).sum(),
+        )
+        * 100
+    )
 
     # 收益与风险统计。复制一次可消除大量逐列计算造成的 DataFrame 碎片。
     frame = frame.copy()
     for window in (1, 5, 20, 60, 120, 250):
         frame[f"RETURN_{window}D"] = close.pct_change(window, fill_method=None) * 100
-    frame["ROLLING_SHARPE_60"] = safe_div(returns.rolling(60).mean(), returns.rolling(60).std(ddof=0)) * np.sqrt(252)
+    frame["ROLLING_SHARPE_60"] = safe_div(
+        returns.rolling(60).mean(), returns.rolling(60).std(ddof=0)
+    ) * np.sqrt(252)
     frame["VAR_95_60"] = returns.rolling(60).quantile(0.05) * 100
     frame["SKEW_60"] = returns.rolling(60).skew()
     frame["KURT_60"] = returns.rolling(60).kurt()
@@ -489,20 +675,40 @@ def calculate_indicators(
     upper_shadow = high - pd.concat([close, open_price], axis=1).max(axis=1)
     lower_shadow = pd.concat([close, open_price], axis=1).min(axis=1) - low
     frame["PATTERN_DOJI"] = (body <= candle_range * 0.1).astype(float)
-    frame["PATTERN_HAMMER"] = ((lower_shadow >= body * 2) & (upper_shadow <= body)).astype(float)
-    frame["PATTERN_SHOOTING_STAR"] = -((upper_shadow >= body * 2) & (lower_shadow <= body)).astype(float)
-    bullish_engulf = (close > open_price) & (close.shift(1) < open_price.shift(1)) & (close >= open_price.shift(1)) & (open_price <= close.shift(1))
-    bearish_engulf = (close < open_price) & (close.shift(1) > open_price.shift(1)) & (open_price >= close.shift(1)) & (close <= open_price.shift(1))
-    frame["PATTERN_ENGULFING"] = bullish_engulf.astype(float) - bearish_engulf.astype(float)
+    frame["PATTERN_HAMMER"] = (
+        (lower_shadow >= body * 2) & (upper_shadow <= body)
+    ).astype(float)
+    frame["PATTERN_SHOOTING_STAR"] = -(
+        (upper_shadow >= body * 2) & (lower_shadow <= body)
+    ).astype(float)
+    bullish_engulf = (
+        (close > open_price)
+        & (close.shift(1) < open_price.shift(1))
+        & (close >= open_price.shift(1))
+        & (open_price <= close.shift(1))
+    )
+    bearish_engulf = (
+        (close < open_price)
+        & (close.shift(1) > open_price.shift(1))
+        & (open_price >= close.shift(1))
+        & (close <= open_price.shift(1))
+    )
+    frame["PATTERN_ENGULFING"] = bullish_engulf.astype(float) - bearish_engulf.astype(
+        float
+    )
 
     frame = frame.replace([np.inf, -np.inf], np.nan)
     extended_definitions: list[IndicatorDefinition] = []
     if include_extended:
-        extended, extended_definitions = _calculate_extended_indicators(source.reset_index(drop=True))
+        extended, extended_definitions = _calculate_extended_indicators(
+            source.reset_index(drop=True)
+        )
         duplicate_columns = [column for column in extended if column in frame]
         if duplicate_columns:
             extended = extended.drop(columns=duplicate_columns)
-        frame = pd.concat([frame.reset_index(drop=True), extended.reset_index(drop=True)], axis=1)
+        frame = pd.concat(
+            [frame.reset_index(drop=True), extended.reset_index(drop=True)], axis=1
+        )
     frame.attrs["extended_indicator_definitions"] = extended_definitions
     return frame
 
@@ -597,7 +803,9 @@ def detailed_indicator_description(definition: IndicatorDefinition) -> str:
         (text for key, text in _INDICATOR_EXPLANATIONS.items() if key in name),
         "该条目基于当前证券的公开 OHLCV、成交额或其滚动统计结果计算，最新值使用最近一个有效交易点。",
     )
-    dimension = _DIMENSION_EXPLANATIONS.get(definition.category, "应与价格、成交量和市场环境交叉验证。")
+    dimension = _DIMENSION_EXPLANATIONS.get(
+        definition.category, "应与价格、成交量和市场环境交叉验证。"
+    )
     source = (
         "这是用户公式生成的本地自定义指标。"
         if definition.origin == "自定义"
@@ -615,22 +823,40 @@ INDICATOR_CATALOG = [
     IndicatorDefinition("趋势", "MA10", "SMA_10", "10日平均价格，反映短线趋势", "元"),
     IndicatorDefinition("趋势", "MA20", "SMA_20", "20日平均价格，中短期趋势基准", "元"),
     IndicatorDefinition("趋势", "MA60", "SMA_60", "60日平均价格，中期趋势基准", "元"),
-    IndicatorDefinition("趋势", "MA120", "SMA_120", "120日平均价格，长期趋势参考", "元"),
-    IndicatorDefinition("趋势", "MA250", "SMA_250", "250日年线，长期多空分界参考", "元"),
+    IndicatorDefinition(
+        "趋势", "MA120", "SMA_120", "120日平均价格，长期趋势参考", "元"
+    ),
+    IndicatorDefinition(
+        "趋势", "MA250", "SMA_250", "250日年线，长期多空分界参考", "元"
+    ),
     IndicatorDefinition("趋势", "EMA12", "EMA_12", "近期权重更高的12日指数均线", "元"),
     IndicatorDefinition("趋势", "EMA26", "EMA_26", "MACD的长期指数均线", "元"),
     IndicatorDefinition("趋势", "MACD DIF", "MACD_DIF", "EMA12与EMA26之差"),
     IndicatorDefinition("趋势", "MACD DEA", "MACD_DEA", "DIF的9日指数平滑线"),
-    IndicatorDefinition("趋势", "MACD柱", "MACD_HIST", "趋势动量加速度，DIF与DEA差的两倍"),
+    IndicatorDefinition(
+        "趋势", "MACD柱", "MACD_HIST", "趋势动量加速度，DIF与DEA差的两倍"
+    ),
     IndicatorDefinition("趋势", "ADX14", "ADX_14", "趋势强度，不判断方向", "%"),
     IndicatorDefinition("趋势", "+DI14", "PLUS_DI_14", "上行方向运动强度", "%"),
     IndicatorDefinition("趋势", "-DI14", "MINUS_DI_14", "下行方向运动强度", "%"),
-    IndicatorDefinition("趋势", "Aroon振荡", "AROON_OSC_25", "近期高低点出现时间差，衡量趋势方向", "%"),
-    IndicatorDefinition("趋势", "抛物线SAR", "PSAR", "跟踪趋势并提供移动止损参考", "元"),
-    IndicatorDefinition("趋势", "Supertrend", "SUPERTREND", "ATR通道型趋势跟踪线", "元"),
-    IndicatorDefinition("趋势", "一目均衡转换线", "ICHIMOKU_TENKAN", "9周期高低点中值", "元"),
-    IndicatorDefinition("趋势", "一目均衡基准线", "ICHIMOKU_KIJUN", "26周期高低点中值", "元"),
-    IndicatorDefinition("趋势", "20日线性斜率", "LINREG_SLOPE_20", "20日收盘价回归线每日斜率"),
+    IndicatorDefinition(
+        "趋势", "Aroon振荡", "AROON_OSC_25", "近期高低点出现时间差，衡量趋势方向", "%"
+    ),
+    IndicatorDefinition(
+        "趋势", "抛物线SAR", "PSAR", "跟踪趋势并提供移动止损参考", "元"
+    ),
+    IndicatorDefinition(
+        "趋势", "Supertrend", "SUPERTREND", "ATR通道型趋势跟踪线", "元"
+    ),
+    IndicatorDefinition(
+        "趋势", "一目均衡转换线", "ICHIMOKU_TENKAN", "9周期高低点中值", "元"
+    ),
+    IndicatorDefinition(
+        "趋势", "一目均衡基准线", "ICHIMOKU_KIJUN", "26周期高低点中值", "元"
+    ),
+    IndicatorDefinition(
+        "趋势", "20日线性斜率", "LINREG_SLOPE_20", "20日收盘价回归线每日斜率"
+    ),
     IndicatorDefinition("趋势", "BBI多空线", "BBI", "3/6/12/24日均线的综合均值", "元"),
     IndicatorDefinition("趋势", "DMA", "DMA", "10日均线与50日均线之差"),
     IndicatorDefinition("动量", "RSI6", "RSI_6", "短周期相对强弱", "%"),
@@ -639,15 +865,21 @@ INDICATOR_CATALOG = [
     IndicatorDefinition("动量", "KDJ-K", "KDJ_K", "当前收盘在9日区间的位置", "%"),
     IndicatorDefinition("动量", "KDJ-D", "KDJ_D", "K值平滑线", "%"),
     IndicatorDefinition("动量", "KDJ-J", "KDJ_J", "放大的极端情绪线", "%"),
-    IndicatorDefinition("动量", "随机指标%K", "STOCH_K_14", "收盘价在14日高低区间的位置", "%"),
+    IndicatorDefinition(
+        "动量", "随机指标%K", "STOCH_K_14", "收盘价在14日高低区间的位置", "%"
+    ),
     IndicatorDefinition("动量", "威廉%R", "WILLR_14", "接近0偏强，接近-100偏弱", "%"),
     IndicatorDefinition("动量", "ROC12", "ROC_12", "12日价格变化率", "%"),
     IndicatorDefinition("动量", "MOM10", "MOM_10", "当前价与10日前价格差", "元"),
     IndicatorDefinition("动量", "CCI20", "CCI_20", "价格偏离典型价格均值的程度"),
     IndicatorDefinition("动量", "CMO14", "CMO_14", "净上涨动量占总动量比例", "%"),
-    IndicatorDefinition("动量", "TRIX12", "TRIX_12", "三重EMA变化率，过滤短期噪声", "%"),
+    IndicatorDefinition(
+        "动量", "TRIX12", "TRIX_12", "三重EMA变化率，过滤短期噪声", "%"
+    ),
     IndicatorDefinition("动量", "PPO", "PPO", "百分比价格振荡器，可跨价格比较", "%"),
-    IndicatorDefinition("动量", "终极振荡器", "ULTOSC", "融合7/14/28周期的多尺度动量", "%"),
+    IndicatorDefinition(
+        "动量", "终极振荡器", "ULTOSC", "融合7/14/28周期的多尺度动量", "%"
+    ),
     IndicatorDefinition("情绪", "PSY12", "PSY_12", "12日上涨天数占比", "%"),
     IndicatorDefinition("情绪", "BIAS6", "BIAS_6", "价格相对6日均线的乖离", "%"),
     IndicatorDefinition("情绪", "BIAS12", "BIAS_12", "价格相对12日均线的乖离", "%"),
@@ -657,18 +889,36 @@ INDICATOR_CATALOG = [
     IndicatorDefinition("波动", "布林上轨", "BB_UPPER", "20日均线加2倍标准差", "元"),
     IndicatorDefinition("波动", "布林中轨", "BB_MID", "20日均线", "元"),
     IndicatorDefinition("波动", "布林下轨", "BB_LOWER", "20日均线减2倍标准差", "元"),
-    IndicatorDefinition("波动", "布林带宽", "BB_WIDTH", "布林带相对宽度，收口表示波动压缩", "%"),
-    IndicatorDefinition("波动", "布林%B", "BB_PERCENT_B", "价格在布林上下轨中的相对位置", "%"),
+    IndicatorDefinition(
+        "波动", "布林带宽", "BB_WIDTH", "布林带相对宽度，收口表示波动压缩", "%"
+    ),
+    IndicatorDefinition(
+        "波动", "布林%B", "BB_PERCENT_B", "价格在布林上下轨中的相对位置", "%"
+    ),
     IndicatorDefinition("波动", "ATR14", "ATR_14", "包含跳空的14日真实波幅", "元"),
-    IndicatorDefinition("波动", "NATR14", "NATR_14", "ATR占价格比例，便于跨标的比较", "%"),
-    IndicatorDefinition("波动", "20日历史波动率", "HV_20", "日对数收益率年化标准差", "%"),
+    IndicatorDefinition(
+        "波动", "NATR14", "NATR_14", "ATR占价格比例，便于跨标的比较", "%"
+    ),
+    IndicatorDefinition(
+        "波动", "20日历史波动率", "HV_20", "日对数收益率年化标准差", "%"
+    ),
     IndicatorDefinition("波动", "肯特纳上轨", "KELTNER_UPPER", "EMA20加2倍ATR", "元"),
-    IndicatorDefinition("波动", "唐奇安上轨", "DONCHIAN_UPPER_20", "20日最高价，突破系统常用", "元"),
-    IndicatorDefinition("波动", "唐奇安下轨", "DONCHIAN_LOWER_20", "20日最低价，突破系统常用", "元"),
-    IndicatorDefinition("波动", "Chaikin波动率", "CHAIKIN_VOL_10", "高低价差EMA的变化率", "%"),
-    IndicatorDefinition("波动", "Ulcer指数", "ULCER_20", "只惩罚向下回撤的波动指标", "%"),
+    IndicatorDefinition(
+        "波动", "唐奇安上轨", "DONCHIAN_UPPER_20", "20日最高价，突破系统常用", "元"
+    ),
+    IndicatorDefinition(
+        "波动", "唐奇安下轨", "DONCHIAN_LOWER_20", "20日最低价，突破系统常用", "元"
+    ),
+    IndicatorDefinition(
+        "波动", "Chaikin波动率", "CHAIKIN_VOL_10", "高低价差EMA的变化率", "%"
+    ),
+    IndicatorDefinition(
+        "波动", "Ulcer指数", "ULCER_20", "只惩罚向下回撤的波动指标", "%"
+    ),
     IndicatorDefinition("量能", "OBV", "OBV", "上涨日加量、下跌日减量的累计能量潮"),
-    IndicatorDefinition("量能", "MFI14", "MFI_14", "融合典型价格与成交量的资金流量指标", "%"),
+    IndicatorDefinition(
+        "量能", "MFI14", "MFI_14", "融合典型价格与成交量的资金流量指标", "%"
+    ),
     IndicatorDefinition("量能", "CMF20", "CMF_20", "20日收盘位置加权的量能流入强度"),
     IndicatorDefinition("量能", "A/D累计线", "ADL", "收盘在日内区间位置加权的累计量"),
     IndicatorDefinition("量能", "Chaikin振荡", "CHAIKIN_OSC", "A/D线的短长EMA差"),
@@ -676,14 +926,22 @@ INDICATOR_CATALOG = [
     IndicatorDefinition("量能", "Force Index", "FORCE_13", "价格变化乘成交量后平滑"),
     IndicatorDefinition("量能", "EMV14", "EMV_14", "价格位移相对成交量和振幅的效率"),
     IndicatorDefinition("量能", "量比5", "VOLUME_RATIO_5", "当日量相对前5日均量"),
-    IndicatorDefinition("量能", "VWAP", "VWAP", "成交额除以成交量得到的成交均价估算", "元"),
+    IndicatorDefinition(
+        "量能", "VWAP", "VWAP", "成交额除以成交量得到的成交均价估算", "元"
+    ),
     IndicatorDefinition("风险", "1日收益", "RETURN_1D", "最近1个交易日收益", "%"),
     IndicatorDefinition("风险", "5日收益", "RETURN_5D", "最近5个交易日收益", "%"),
     IndicatorDefinition("风险", "20日收益", "RETURN_20D", "最近20个交易日收益", "%"),
     IndicatorDefinition("风险", "60日收益", "RETURN_60D", "最近60个交易日收益", "%"),
-    IndicatorDefinition("风险", "60日夏普", "ROLLING_SHARPE_60", "无风险利率按0处理的年化收益波动比"),
-    IndicatorDefinition("风险", "60日VaR95", "VAR_95_60", "历史法估计的单日5%分位收益", "%"),
-    IndicatorDefinition("风险", "当前回撤", "DRAWDOWN", "相对历史最高收盘价的回撤", "%"),
+    IndicatorDefinition(
+        "风险", "60日夏普", "ROLLING_SHARPE_60", "无风险利率按0处理的年化收益波动比"
+    ),
+    IndicatorDefinition(
+        "风险", "60日VaR95", "VAR_95_60", "历史法估计的单日5%分位收益", "%"
+    ),
+    IndicatorDefinition(
+        "风险", "当前回撤", "DRAWDOWN", "相对历史最高收盘价的回撤", "%"
+    ),
     IndicatorDefinition("风险", "60日偏度", "SKEW_60", "收益分布左右不对称程度"),
     IndicatorDefinition("风险", "60日峰度", "KURT_60", "收益分布尾部厚度"),
 ]
@@ -724,7 +982,18 @@ def indicator_status(column: str, value: float | None, frame: pd.DataFrame) -> s
         return "偏热" if value > -20 else "偏冷" if value < -80 else "中性"
     if column == "ADX_14":
         return "强趋势" if value >= 25 else "趋势形成" if value >= 20 else "震荡"
-    if column in {"PLUS_DI_14", "AROON_OSC_25", "MACD_HIST", "MACD_DIF", "PPO", "DMA", "LINREG_SLOPE_20", "CMF_20", "CHAIKIN_OSC", "FORCE_13"}:
+    if column in {
+        "PLUS_DI_14",
+        "AROON_OSC_25",
+        "MACD_HIST",
+        "MACD_DIF",
+        "PPO",
+        "DMA",
+        "LINREG_SLOPE_20",
+        "CMF_20",
+        "CHAIKIN_OSC",
+        "FORCE_13",
+    }:
         return "偏多" if value > 0 else "偏空" if value < 0 else "中性"
     if column == "MINUS_DI_14":
         plus = _latest_number(frame, "PLUS_DI_14")
@@ -741,7 +1010,26 @@ def indicator_status(column: str, value: float | None, frame: pd.DataFrame) -> s
         return "上轨外" if value > 100 else "下轨外" if value < 0 else "带内"
     if column in {"RETURN_1D", "RETURN_5D", "RETURN_20D", "RETURN_60D"}:
         return "上涨" if value > 0 else "下跌" if value < 0 else "持平"
-    if column in {"SMA_5", "SMA_10", "SMA_20", "SMA_60", "SMA_120", "SMA_250", "EMA_12", "EMA_26", "BBI", "PSAR", "SUPERTREND", "ICHIMOKU_TENKAN", "ICHIMOKU_KIJUN", "VWAP"} and close is not None:
+    if (
+        column
+        in {
+            "SMA_5",
+            "SMA_10",
+            "SMA_20",
+            "SMA_60",
+            "SMA_120",
+            "SMA_250",
+            "EMA_12",
+            "EMA_26",
+            "BBI",
+            "PSAR",
+            "SUPERTREND",
+            "ICHIMOKU_TENKAN",
+            "ICHIMOKU_KIJUN",
+            "VWAP",
+        }
+        and close is not None
+    ):
         return "价在线上" if close >= value else "价在线下"
     if column == "VOLUME_RATIO_5":
         return "明显放量" if value >= 1.5 else "缩量" if value < 0.7 else "常态"
@@ -843,7 +1131,9 @@ def dimension_composites(
             for snapshot in snapshots
             if snapshot.definition.category == dimension and snapshot.value is not None
         ]
-        effects = np.asarray([_snapshot_effect(snapshot) for snapshot in members], dtype=float)
+        effects = np.asarray(
+            [_snapshot_effect(snapshot) for snapshot in members], dtype=float
+        )
         weights = np.asarray(
             [indicator_weight(snapshot.definition) for snapshot in members], dtype=float
         )
@@ -852,7 +1142,9 @@ def dimension_composites(
             if effects.size and float(weights.sum()) > 0
             else 0.0
         )
-        score = float(np.clip((weighted_effect + 1) * 50, 0, 100)) if effects.size else 50.0
+        score = (
+            float(np.clip((weighted_effect + 1) * 50, 0, 100)) if effects.size else 50.0
+        )
         if score >= 67:
             status = "综合偏多"
         elif score >= 56:
@@ -874,7 +1166,12 @@ def dimension_composites(
 
 def market_regime(frame: pd.DataFrame) -> dict[str, str | float]:
     if frame.empty:
-        return {"regime": "数据不足", "direction": "未知", "score": 0.0, "summary": "暂无行情数据"}
+        return {
+            "regime": "数据不足",
+            "direction": "未知",
+            "score": 0.0,
+            "summary": "暂无行情数据",
+        }
     adx = _latest_number(frame, "ADX_14") or 0.0
     system_snapshots = [
         snapshot
@@ -886,8 +1183,15 @@ def market_regime(frame: pd.DataFrame) -> dict[str, str | float]:
     score = float(np.mean(scores)) if scores else 50.0
     direction = "偏多" if score >= 60 else "偏空" if score <= 40 else "中性"
     regime = "趋势" if adx >= 25 else "趋势酝酿" if adx >= 20 else "震荡"
-    summary = f"{regime}环境，综合状态{direction}。ADX {adx:.1f}，多维评分 {score:.0f}/100。"
-    return {"regime": regime, "direction": direction, "score": score, "summary": summary}
+    summary = (
+        f"{regime}环境，综合状态{direction}。ADX {adx:.1f}，多维评分 {score:.0f}/100。"
+    )
+    return {
+        "regime": regime,
+        "direction": direction,
+        "score": score,
+        "summary": summary,
+    }
 
 
 def candle_pattern_summary(frame: pd.DataFrame) -> str:

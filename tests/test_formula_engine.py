@@ -59,4 +59,3 @@ def test_formula_engine_rejects_arbitrary_python(frame: pd.DataFrame, formula: s
 def test_formula_engine_reports_dependencies(frame: pd.DataFrame) -> None:
     validation = FormulaEngine(frame).validate("ZSCORE(returns, 20) + ZSCORE(volume, 20)")
     assert validation.dependencies == ("returns", "volume")
-

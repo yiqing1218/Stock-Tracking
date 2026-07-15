@@ -8,6 +8,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Callable
 from urllib.parse import quote_plus, urlparse
@@ -19,7 +20,7 @@ import pandas as pd
 import requests
 
 from .models import NewsArticle, Quote, Security, SecurityType
-from .time_utils import beijing_today, cache_age_seconds
+from .time_utils import beijing_now, beijing_today, cache_age_seconds
 
 
 COMMON_INDICES = [
@@ -114,6 +115,7 @@ class DetailBundle:
     company_info: pd.DataFrame = field(default_factory=pd.DataFrame)
     business_info: pd.DataFrame = field(default_factory=pd.DataFrame)
     financials: pd.DataFrame = field(default_factory=pd.DataFrame)
+    corporate_actions: pd.DataFrame = field(default_factory=pd.DataFrame)
     sources: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -124,7 +126,9 @@ class MarketDashboardBundle:
     breadth: dict[str, float | int] = field(default_factory=dict)
     gainers: pd.DataFrame = field(default_factory=pd.DataFrame)
     losers: pd.DataFrame = field(default_factory=pd.DataFrame)
-    sectors: pd.DataFrame = field(default_factory=pd.DataFrame)
+    boards: pd.DataFrame = field(default_factory=pd.DataFrame)
+    sectors: pd.DataFrame = field(default_factory=pd.DataFrame)  # compatibility alias
+    trade_date: date | None = None
     sources: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -143,7 +147,10 @@ class DataProvider:
         if not force and cache_path.exists():
             try:
                 values = json.loads(cache_path.read_text(encoding="utf-8"))
-                cached = {item.key: item for item in (Security.from_dict(value) for value in values)}
+                cached = {
+                    item.key: item
+                    for item in (Security.from_dict(value) for value in values)
+                }
                 for security in [*COMMON_INDICES, *COMMON_ETFS]:
                     cached[security.key] = security
                 return sorted(
@@ -158,7 +165,11 @@ class DataProvider:
             universe[security.key] = security
 
         errors: list[Exception] = []
-        for loader in (self._load_stock_universe, self._load_etf_universe, self._load_index_universe):
+        for loader in (
+            self._load_stock_universe,
+            self._load_etf_universe,
+            self._load_index_universe,
+        ):
             try:
                 for security in loader():
                     universe[security.key] = security
@@ -169,7 +180,10 @@ class DataProvider:
             universe.values(),
             key=lambda item: (item.security_type.value, item.code, item.name),
         )
-        if len(values) <= len(COMMON_INDICES) + len(COMMON_ETFS) and cache_path.exists():
+        if (
+            len(values) <= len(COMMON_INDICES) + len(COMMON_ETFS)
+            and cache_path.exists()
+        ):
             try:
                 cached = json.loads(cache_path.read_text(encoding="utf-8"))
                 return [Security.from_dict(value) for value in cached]
@@ -187,7 +201,14 @@ class DataProvider:
         for row in frame.itertuples(index=False):
             code = str(getattr(row, "code")).zfill(6)
             name = str(getattr(row, "name"))
-            result.append(Security(code, name, SecurityType.STOCK, infer_market(code, SecurityType.STOCK)))
+            result.append(
+                Security(
+                    code,
+                    name,
+                    SecurityType.STOCK,
+                    infer_market(code, SecurityType.STOCK),
+                )
+            )
         return result
 
     def _load_etf_universe(self) -> list[Security]:
@@ -197,7 +218,14 @@ class DataProvider:
             code = str(row.get("代码", "")).zfill(6)
             name = str(row.get("名称", ""))
             if re.fullmatch(r"\d{6}", code) and name:
-                result.append(Security(code, name, SecurityType.ETF, infer_market(code, SecurityType.ETF)))
+                result.append(
+                    Security(
+                        code,
+                        name,
+                        SecurityType.ETF,
+                        infer_market(code, SecurityType.ETF),
+                    )
+                )
         return result
 
     def _load_index_universe(self) -> list[Security]:
@@ -220,7 +248,9 @@ class DataProvider:
     def refresh_quotes(self, securities: list[Security]) -> dict[str, Quote]:
         quotes: dict[str, Quote] = {}
         # 单证券并发请求比下载全市场分页快得多；每个请求有硬超时，避免监看页长时间空白。
-        with ThreadPoolExecutor(max_workers=min(8, max(1, len(securities)))) as executor:
+        with ThreadPoolExecutor(
+            max_workers=min(8, max(1, len(securities)))
+        ) as executor:
             future_map = {
                 executor.submit(self._fetch_direct_quote, security): security
                 for security in securities
@@ -236,8 +266,10 @@ class DataProvider:
             if security.key in quotes:
                 continue
             candidates = (
-                self.cache_dir / f"history_{security.security_type.value}_{security.code}_qfq.csv",
-                self.cache_dir / f"history_{security.security_type.value}_{security.code}.csv",
+                self.cache_dir
+                / f"history_{security.security_type.value}_{security.code}_qfq.csv",
+                self.cache_dir
+                / f"history_{security.security_type.value}_{security.code}.csv",
             )
             path = next((item for item in candidates if item.exists()), candidates[0])
             history = self._read_frame(path) if path.exists() else pd.DataFrame()
@@ -260,9 +292,9 @@ class DataProvider:
                 self._load_market_spot,
                 timedelta(seconds=45),
             ),
-            "sectors": (
-                "market_sectors",
-                self._load_industry_boards,
+            "boards": (
+                "market_boards",
+                self._load_all_boards,
                 timedelta(minutes=3),
             ),
         }
@@ -307,75 +339,155 @@ class DataProvider:
                 (column for column in ("最新价", "最新") if column in spot),
                 None,
             )
-            if change_column:
-                changes = pd.to_numeric(spot[change_column], errors="coerce")
+            previous_column = next(
+                (column for column in ("昨收", "前收盘") if column in spot),
+                None,
+            )
+            timestamp_column = next(
+                (column for column in ("更新时间戳", "时间戳") if column in spot),
+                None,
+            )
+            if timestamp_column:
+                timestamps = pd.to_datetime(
+                    pd.to_numeric(spot[timestamp_column], errors="coerce"),
+                    unit="s",
+                    utc=True,
+                    errors="coerce",
+                ).dt.tz_convert("Asia/Shanghai")
+                valid_dates = timestamps.dropna()
+                if not valid_dates.empty:
+                    bundle.trade_date = valid_dates.dt.date.max()
+                    spot = spot[timestamps.dt.date == bundle.trade_date].copy()
+            if change_column and price_column:
+                prices = pd.to_numeric(spot[price_column], errors="coerce")
+                previous = (
+                    pd.to_numeric(spot[previous_column], errors="coerce")
+                    if previous_column
+                    else pd.Series(np.nan, index=spot.index)
+                )
+                reported_changes = pd.to_numeric(spot[change_column], errors="coerce")
+                if not previous_column:
+                    previous = prices / (1 + reported_changes / 100)
+                calculated_changes = (prices / previous - 1) * 100
+                changes = calculated_changes.where(previous > 0, reported_changes)
+                active = prices.gt(0) & changes.notna()
+                spot = spot[active].copy()
+                prices = prices[active]
+                previous = previous[active]
+                changes = changes[active]
                 valid = changes.dropna()
                 amounts = (
-                    pd.to_numeric(spot[amount_column], errors="coerce")
+                    pd.to_numeric(spot[amount_column], errors="coerce").fillna(0)
                     if amount_column
-                    else pd.Series(dtype=float)
+                    else pd.Series(0.0, index=spot.index)
                 )
+                codes = (
+                    spot[code_column]
+                    .astype(str)
+                    .str.extract(r"(\d+)", expand=False)
+                    .str.zfill(6)
+                    if code_column
+                    else pd.Series("", index=spot.index)
+                )
+                names = (
+                    spot[name_column].astype(str)
+                    if name_column
+                    else pd.Series("", index=spot.index)
+                )
+                limit_up = 0
+                limit_down = 0
+                for row_index in spot.index:
+                    prev = _as_float(previous.get(row_index))
+                    price = _as_float(prices.get(row_index))
+                    if not prev or not price:
+                        continue
+                    name = str(names.get(row_index, ""))
+                    code = str(codes.get(row_index, ""))
+                    if self._is_unlimited_new_listing(name):
+                        continue
+                    rate = self._a_share_limit_rate(code, name)
+                    upper = self._rounded_limit_price(prev, 1 + rate)
+                    lower = self._rounded_limit_price(prev, 1 - rate)
+                    limit_up += int(price >= upper - 0.005)
+                    limit_down += int(price <= lower + 0.005)
                 bundle.breadth = {
                     "up": int((valid > 0).sum()),
                     "down": int((valid < 0).sum()),
                     "flat": int((valid == 0).sum()),
-                    "limit_up": int((valid >= 9.5).sum()),
-                    "limit_down": int((valid <= -9.5).sum()),
+                    "limit_up": limit_up,
+                    "limit_down": limit_down,
                     "median_change": float(valid.median()) if not valid.empty else 0.0,
                     "amount": float(amounts.sum()) if not amounts.empty else 0.0,
                 }
                 if code_column and name_column and price_column:
                     movers = pd.DataFrame(
                         {
-                            "代码": spot[code_column].astype(str).str.extract(r"(\d+)", expand=False).str.zfill(6),
-                            "名称": spot[name_column].astype(str),
-                            "最新价": pd.to_numeric(spot[price_column], errors="coerce"),
+                            "代码": codes,
+                            "名称": names,
+                            "最新价": prices,
                             "涨跌幅": changes,
-                            "成交额": amounts.reindex(spot.index),
+                            "成交额": amounts,
                         }
-                    ).dropna(subset=["涨跌幅"])
+                    ).dropna(subset=["涨跌幅", "最新价"])
+                    movers = movers[(movers["成交额"] > 0) & (movers["最新价"] > 0)]
                     bundle.gainers = movers.nlargest(8, "涨跌幅").reset_index(drop=True)
                     bundle.losers = movers.nsmallest(8, "涨跌幅").reset_index(drop=True)
             bundle.sources["breadth"] = str(
                 spot.attrs.get("source", "AkShare·东方财富A股快照/本地缓存")
             )
 
-        sectors = frames.get("sectors", pd.DataFrame())
-        if not sectors.empty:
-            name_column = next(
-                (column for column in ("板块名称", "名称") if column in sectors),
-                None,
+        boards = frames.get("boards", pd.DataFrame())
+        if not boards.empty:
+            boards = boards.copy()
+            board_timestamp = next(
+                (name for name in ("更新时间戳", "时间戳") if name in boards), None
             )
-            change_column = next(
-                (column for column in ("涨跌幅", "涨跌幅%") if column in sectors),
-                None,
+            if board_timestamp:
+                timestamps = pd.to_datetime(
+                    pd.to_numeric(boards[board_timestamp], errors="coerce"),
+                    unit="s",
+                    utc=True,
+                    errors="coerce",
+                ).dt.tz_convert("Asia/Shanghai")
+                board_date = bundle.trade_date or (
+                    timestamps.dropna().dt.date.max()
+                    if not timestamps.dropna().empty
+                    else None
+                )
+                if board_date:
+                    boards = boards[timestamps.dt.date == board_date].copy()
+            boards["涨跌幅"] = pd.to_numeric(boards.get("涨跌幅"), errors="coerce")
+            boards = boards.dropna(subset=["涨跌幅"]).sort_values(
+                "涨跌幅", ascending=False
             )
-            leader_column = next(
-                (column for column in ("领涨股票", "领涨股") if column in sectors),
-                None,
-            )
-            leader_change_column = next(
-                (column for column in ("领涨股票-涨跌幅", "领涨股涨跌幅") if column in sectors),
-                None,
-            )
-            if name_column and change_column:
-                output = pd.DataFrame(
-                    {
-                        "行业": sectors[name_column].astype(str),
-                        "涨跌幅": pd.to_numeric(sectors[change_column], errors="coerce"),
-                        "领涨股": sectors[leader_column].astype(str) if leader_column else "—",
-                        "领涨股涨跌幅": (
-                            pd.to_numeric(sectors[leader_change_column], errors="coerce")
-                            if leader_change_column
-                            else np.nan
-                        ),
-                    }
-                ).dropna(subset=["涨跌幅"])
-                bundle.sectors = output.nlargest(10, "涨跌幅").reset_index(drop=True)
-            bundle.sources["sectors"] = str(
-                sectors.attrs.get("source", "AkShare·东方财富行业板块/本地缓存")
+            bundle.boards = boards.reset_index(drop=True)
+            bundle.sectors = bundle.boards.copy()
+            if "行业" not in bundle.sectors and "板块名称" in bundle.sectors:
+                bundle.sectors["行业"] = bundle.sectors["板块名称"]
+            bundle.sources["boards"] = str(
+                boards.attrs.get("source", "东方财富行业/概念板块/本地缓存")
             )
         return bundle
+
+    @staticmethod
+    def _a_share_limit_rate(code: str, name: str) -> float:
+        if "ST" in name.upper():
+            return 0.05
+        if code.startswith(("300", "301", "688", "689")):
+            return 0.20
+        if code.startswith(("4", "8", "92")):
+            return 0.30
+        return 0.10
+
+    @staticmethod
+    def _is_unlimited_new_listing(name: str) -> bool:
+        normalized = name.upper().strip()
+        return normalized.startswith(("N", "C"))
+
+    @staticmethod
+    def _rounded_limit_price(previous_close: float, multiplier: float) -> float:
+        value = Decimal(str(previous_close)) * Decimal(str(multiplier))
+        return float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
     @staticmethod
     def _eastmoney_clist(
@@ -395,7 +507,10 @@ class DataProvider:
                 "fs": fs,
                 "fields": fields,
             },
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://quote.eastmoney.com/",
+            },
             timeout=8,
         )
         response.raise_for_status()
@@ -408,15 +523,33 @@ class DataProvider:
     def _load_market_spot(self) -> pd.DataFrame:
         errors: list[str] = []
         try:
+            frame = self._load_market_spot_tencent()
+            frame.attrs["source"] = "腾讯全A分批实时快照"
+            return frame
+        except Exception as exc:
+            errors.append(f"腾讯分批行情: {exc}")
+        try:
             raw = self._eastmoney_clist(
-                "https://push2.eastmoney.com/api/qt/clist/get",
-                fs="m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:7+f:!2",
-                fields="f12,f14,f2,f3,f6",
+                "https://82.push2.eastmoney.com/api/qt/clist/get",
+                fs="m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
+                fields="f12,f14,f2,f3,f6,f13,f15,f16,f17,f18,f124",
                 page_size=6000,
             )
             frame = raw.rename(
-                columns={"f12": "代码", "f14": "名称", "f2": "最新价", "f3": "涨跌幅", "f6": "成交额"}
-            )[["代码", "名称", "最新价", "涨跌幅", "成交额"]]
+                columns={
+                    "f12": "代码",
+                    "f14": "名称",
+                    "f2": "最新价",
+                    "f3": "涨跌幅",
+                    "f6": "成交额",
+                    "f13": "市场编号",
+                    "f15": "最高",
+                    "f16": "最低",
+                    "f17": "今开",
+                    "f18": "昨收",
+                    "f124": "更新时间戳",
+                }
+            )
             frame.attrs["source"] = "东方财富全A快照直连"
             return frame
         except Exception as exc:
@@ -430,35 +563,131 @@ class DataProvider:
             errors.append(f"AkShare: {exc}")
         raise RuntimeError("；".join(errors))
 
-    def _load_industry_boards(self) -> pd.DataFrame:
+    def _load_market_spot_tencent(self) -> pd.DataFrame:
+        universe = [
+            item
+            for item in self.load_universe()
+            if item.security_type is SecurityType.STOCK
+        ]
+        if len(universe) < 1000:
+            raise RuntimeError("本地A股证券目录不完整")
+        batches = [
+            universe[index : index + 120] for index in range(0, len(universe), 120)
+        ]
+
+        def load_batch(batch: list[Security]) -> list[dict[str, object]]:
+            symbols = ",".join(self._market_symbol(item) for item in batch)
+            response = requests.get(
+                "https://qt.gtimg.cn/q=" + symbols,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"},
+                timeout=8,
+            )
+            response.raise_for_status()
+            response.encoding = "gbk"
+            rows: list[dict[str, object]] = []
+            for match in re.finditer(r'v_([^=]+)="([^"]*)"', response.text):
+                values = match.group(2).split("~")
+                if len(values) < 38 or not re.fullmatch(r"\d{6}", values[2] or ""):
+                    continue
+                timestamp = values[30] if len(values) > 30 else ""
+                unix_time: float | None = None
+                if re.fullmatch(r"\d{14}", timestamp or ""):
+                    unix_time = (
+                        datetime.strptime(timestamp, "%Y%m%d%H%M%S")
+                        .replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+                        .timestamp()
+                    )
+                rows.append(
+                    {
+                        "代码": values[2],
+                        "名称": values[1],
+                        "最新价": _as_float(values[3]),
+                        "昨收": _as_float(values[4]),
+                        "今开": _as_float(values[5]),
+                        "涨跌幅": _as_float(values[32]),
+                        "最高": _as_float(values[33]),
+                        "最低": _as_float(values[34]),
+                        "成交额": (_as_float(values[37]) or 0) * 10_000,
+                        "更新时间戳": unix_time,
+                    }
+                )
+            return rows
+
+        rows: list[dict[str, object]] = []
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            futures = [executor.submit(load_batch, batch) for batch in batches]
+            for future in as_completed(futures):
+                try:
+                    rows.extend(future.result())
+                except Exception:
+                    continue
+        if len(rows) < max(1000, int(len(universe) * 0.7)):
+            raise RuntimeError(f"仅取得 {len(rows)}/{len(universe)} 只股票")
+        return pd.DataFrame(rows)
+
+    def _load_all_boards(self) -> pd.DataFrame:
         errors: list[str] = []
-        try:
-            raw = self._eastmoney_clist(
+        frames: list[pd.DataFrame] = []
+        for board_type, host, filter_text in (
+            (
+                "行业",
                 "https://17.push2.eastmoney.com/api/qt/clist/get",
-                fs="m:90 t:2 f:!50",
-                fields="f12,f14,f2,f3,f104,f105,f128,f136",
-                page_size=200,
-            )
-            frame = raw.rename(
-                columns={
-                    "f12": "板块代码",
-                    "f14": "板块名称",
-                    "f2": "最新价",
-                    "f3": "涨跌幅",
-                    "f104": "上涨家数",
-                    "f105": "下跌家数",
-                    "f128": "领涨股票",
-                    "f136": "领涨股票-涨跌幅",
-                }
-            )
-            frame.attrs["source"] = "东方财富行业板块直连"
-            return frame
-        except Exception as exc:
-            errors.append(f"东方财富直连: {exc}")
+                "m:90 t:2 f:!50",
+            ),
+            (
+                "概念",
+                "https://79.push2.eastmoney.com/api/qt/clist/get",
+                "m:90 t:3 f:!50",
+            ),
+        ):
+            try:
+                raw = self._eastmoney_clist(
+                    host,
+                    fs=filter_text,
+                    fields="f12,f14,f2,f3,f8,f20,f104,f105,f124",
+                    page_size=1000,
+                )
+                frame = raw.rename(
+                    columns={
+                        "f12": "板块代码",
+                        "f14": "板块名称",
+                        "f2": "最新价",
+                        "f3": "涨跌幅",
+                        "f8": "换手率",
+                        "f20": "总市值",
+                        "f104": "上涨家数",
+                        "f105": "下跌家数",
+                        "f124": "更新时间戳",
+                    }
+                )
+                frame.insert(0, "类型", board_type)
+                frames.append(frame)
+            except Exception as exc:
+                errors.append(f"东方财富{board_type}板块直连: {exc}")
+        if frames:
+            result = pd.concat(frames, ignore_index=True)
+            result.attrs["source"] = "东方财富行业+概念板块直连"
+            return result
         try:
-            frame = ak.stock_board_industry_name_em()
-            frame = frame.copy()
-            frame.attrs["source"] = "AkShare·东方财富行业板块"
+            industry = ak.stock_board_industry_summary_ths().copy()
+            industry = industry.rename(
+                columns={"板块": "板块名称", "均价": "最新价", "总成交额": "成交额"}
+            )
+            industry.insert(0, "类型", "行业")
+            industry["更新时间戳"] = beijing_now().timestamp()
+            industry.attrs["source"] = "AkShare·同花顺行业板块（概念源不可用时回退）"
+            return industry
+        except Exception as exc:
+            errors.append(f"同花顺行业: {exc}")
+        try:
+            industry = ak.stock_board_industry_name_em().copy()
+            concept = ak.stock_board_concept_name_em().copy()
+            industry.insert(0, "类型", "行业")
+            concept.insert(0, "类型", "概念")
+            industry["更新时间戳"] = beijing_now().timestamp()
+            concept["更新时间戳"] = beijing_now().timestamp()
+            frame = pd.concat([industry, concept], ignore_index=True)
+            frame.attrs["source"] = "AkShare·东方财富行业+概念板块"
             return frame
         except Exception as exc:
             errors.append(f"AkShare: {exc}")
@@ -500,8 +729,13 @@ class DataProvider:
             return security.key, score
 
         scores: dict[str, float] = {}
-        with ThreadPoolExecutor(max_workers=min(2, max(1, len(securities)))) as executor:
-            futures = {executor.submit(calculate, security): security for security in securities}
+        with ThreadPoolExecutor(
+            max_workers=min(2, max(1, len(securities)))
+        ) as executor:
+            futures = {
+                executor.submit(calculate, security): security
+                for security in securities
+            }
             for future in as_completed(futures):
                 security = futures[future]
                 try:
@@ -523,8 +757,8 @@ class DataProvider:
     def _fetch_direct_quote(self, security: Security) -> Quote:
         errors: list[str] = []
         for source, loader in (
-            ("东方财富", self._fetch_eastmoney_quote),
             ("腾讯行情", self._fetch_tencent_quote),
+            ("东方财富", self._fetch_eastmoney_quote),
             ("新浪行情", self._fetch_sina_quote),
         ):
             try:
@@ -547,7 +781,10 @@ class DataProvider:
                 "fields": "f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f86,f116,f117,f162,f167,f168,f169,f170,f171",
                 "secid": f"{market_id}.{security.code}",
             },
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://quote.eastmoney.com/",
+            },
             timeout=5,
         )
         response.raise_for_status()
@@ -578,9 +815,11 @@ class DataProvider:
             if timestamp > 10_000_000_000:
                 timestamp /= 1000
             try:
-                quote.extra["trade_datetime"] = datetime.fromtimestamp(
-                    timestamp, tz=timezone.utc
-                ).astimezone(ZoneInfo("Asia/Shanghai")).isoformat()
+                quote.extra["trade_datetime"] = (
+                    datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                    .astimezone(ZoneInfo("Asia/Shanghai"))
+                    .isoformat()
+                )
             except (OSError, OverflowError, ValueError):
                 pass
         return quote
@@ -624,7 +863,9 @@ class DataProvider:
             amount=(_as_float(values[37]) or 0) * 10_000 if len(values) > 37 else None,
             turnover=_as_float(values[38]) if len(values) > 38 else None,
             pe=_as_float(values[39]) if len(values) > 39 else None,
-            market_cap=(_as_float(values[45]) or 0) * 100_000_000 if len(values) > 45 else None,
+            market_cap=(_as_float(values[45]) or 0) * 100_000_000
+            if len(values) > 45
+            else None,
             pb=_as_float(values[46]) if len(values) > 46 else None,
         )
         if len(values) > 30 and re.fullmatch(r"\d{14}", values[30] or ""):
@@ -638,7 +879,10 @@ class DataProvider:
         symbol = self._market_symbol(security)
         response = requests.get(
             "https://hq.sinajs.cn/list=" + symbol,
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://finance.sina.com.cn/",
+            },
             timeout=5,
         )
         response.raise_for_status()
@@ -649,8 +893,16 @@ class DataProvider:
             raise RuntimeError("返回字段不完整")
         price = _as_float(values[3])
         previous_close = _as_float(values[2])
-        change = price - previous_close if price is not None and previous_close is not None else None
-        change_pct = change / previous_close * 100 if change is not None and previous_close else None
+        change = (
+            price - previous_close
+            if price is not None and previous_close is not None
+            else None
+        )
+        change_pct = (
+            change / previous_close * 100
+            if change is not None and previous_close
+            else None
+        )
         quote = Quote(
             security=security,
             price=price,
@@ -698,8 +950,14 @@ class DataProvider:
         row = frame.iloc[-1]
         previous = frame.iloc[-2]["close"] if len(frame) > 1 else np.nan
         close = _as_float(row.get("close"))
-        change = close - float(previous) if close is not None and pd.notna(previous) else None
-        change_pct = change / float(previous) * 100 if change is not None and previous else None
+        change = (
+            close - float(previous)
+            if close is not None and pd.notna(previous)
+            else None
+        )
+        change_pct = (
+            change / float(previous) * 100 if change is not None and previous else None
+        )
         quote = Quote(
             security=security,
             price=close,
@@ -792,25 +1050,39 @@ class DataProvider:
         pct_change = change / previous_close * 100 if previous_close else np.nan
         amplitude = (high - low) / previous_close * 100 if previous_close else np.nan
         existing = result[result["date"] == trade_timestamp]
-        existing_row = existing.iloc[-1] if not existing.empty else pd.Series(dtype=object)
+        existing_row = (
+            existing.iloc[-1] if not existing.empty else pd.Series(dtype=object)
+        )
         live_row = {
             "date": trade_timestamp,
             "open": open_value,
             "close": close,
             "high": high,
             "low": low,
-            "volume": quote.volume if quote.volume is not None else existing_row.get("volume", np.nan),
-            "amount": quote.amount if quote.amount is not None else existing_row.get("amount", np.nan),
-            "amplitude": quote.amplitude if adjustment == "" and quote.amplitude is not None else amplitude,
-            "pct_change": quote.change_pct if adjustment == "" and quote.change_pct is not None else pct_change,
+            "volume": quote.volume
+            if quote.volume is not None
+            else existing_row.get("volume", np.nan),
+            "amount": quote.amount
+            if quote.amount is not None
+            else existing_row.get("amount", np.nan),
+            "amplitude": quote.amplitude
+            if adjustment == "" and quote.amplitude is not None
+            else amplitude,
+            "pct_change": quote.change_pct
+            if adjustment == "" and quote.change_pct is not None
+            else pct_change,
             "change": quote.change * scale if quote.change is not None else change,
-            "turnover": quote.turnover if quote.turnover is not None else existing_row.get("turnover", np.nan),
+            "turnover": quote.turnover
+            if quote.turnover is not None
+            else existing_row.get("turnover", np.nan),
         }
         result = result[result["date"] != trade_timestamp]
         result = pd.concat([result, pd.DataFrame([live_row])], ignore_index=True)
         result = self._normalize_history(result)
         source = self.history_sources.get(security.key, "日线")
-        self.history_sources[security.key] = f"{source} + {quote.extra.get('source', '实时行情')}"
+        self.history_sources[security.key] = (
+            f"{source} + {quote.extra.get('source', '实时行情')}"
+        )
         return result
 
     def get_history(
@@ -820,10 +1092,13 @@ class DataProvider:
         use_cache: bool = True,
         adjustment: str = "qfq",
         include_live: bool = True,
+        persist: bool = True,
     ) -> pd.DataFrame:
         if adjustment not in {"", "qfq", "hfq"}:
             raise ValueError("复权方式只支持不复权、前复权或后复权")
-        effective_adjustment = "" if security.security_type is SecurityType.INDEX else adjustment
+        effective_adjustment = (
+            "" if security.security_type is SecurityType.INDEX else adjustment
+        )
         cache_suffix = effective_adjustment or "raw"
         path = self.cache_dir / (
             f"history_{security.security_type.value}_{security.code}_{cache_suffix}.csv"
@@ -832,9 +1107,11 @@ class DataProvider:
             cached = self._read_frame(path)
             if not cached.empty:
                 self.history_sources[security.key] = "本地缓存"
-                return self._merge_live_daily_bar(
-                    security, cached, effective_adjustment
-                ) if include_live else cached
+                return (
+                    self._merge_live_daily_bar(security, cached, effective_adjustment)
+                    if include_live
+                    else cached
+                )
 
         end = beijing_today()
         start = end - timedelta(days=calendar_days)
@@ -887,8 +1164,24 @@ class DataProvider:
                         adjust=effective_adjustment,
                     ),
                 ),
-                ("AkShare·新浪ETF日线", lambda: ak.fund_etf_hist_sina(symbol=market_symbol)),
+                (
+                    "AkShare·腾讯ETF日线",
+                    lambda: ak.stock_zh_a_hist_tx(
+                        symbol=market_symbol,
+                        start_date=start_text,
+                        end_date=end_text,
+                        adjust=effective_adjustment,
+                        timeout=10,
+                    ),
+                ),
             ]
+            if not effective_adjustment:
+                loaders.append(
+                    (
+                        "AkShare·新浪ETF日线",
+                        lambda: ak.fund_etf_hist_sina(symbol=market_symbol),
+                    )
+                )
         else:
             loaders = [
                 (
@@ -906,7 +1199,10 @@ class DataProvider:
                         symbol=market_symbol, start_date=start_text, end_date=end_text
                     ),
                 ),
-                ("AkShare·新浪指数日线", lambda: ak.stock_zh_index_daily(symbol=market_symbol)),
+                (
+                    "AkShare·新浪指数日线",
+                    lambda: ak.stock_zh_index_daily(symbol=market_symbol),
+                ),
                 (
                     "AkShare·东方财富指数历史",
                     lambda: ak.index_zh_a_hist(
@@ -921,29 +1217,122 @@ class DataProvider:
         errors: list[str] = []
         for source, loader in loaders:
             try:
-                normalized = self._normalize_history(self._call_with_timeout(loader, 12))
+                normalized = self._normalize_history(
+                    self._call_with_timeout(loader, 12)
+                )
                 normalized = normalized[
                     (normalized["date"] >= pd.Timestamp(start))
                     & (normalized["date"] <= pd.Timestamp(end) + pd.Timedelta(days=1))
                 ]
                 if normalized.empty:
                     raise RuntimeError("返回空数据")
-                normalized.to_csv(path, index=False, encoding="utf-8-sig")
+                if persist:
+                    normalized.to_csv(path, index=False, encoding="utf-8-sig")
                 self.history_sources[security.key] = source
                 normalized = normalized.reset_index(drop=True)
-                return self._merge_live_daily_bar(
-                    security, normalized, effective_adjustment
-                ) if include_live else normalized
+                return (
+                    self._merge_live_daily_bar(
+                        security, normalized, effective_adjustment
+                    )
+                    if include_live
+                    else normalized
+                )
             except Exception as exc:
                 errors.append(f"{source}: {exc}")
+        if security.security_type is SecurityType.ETF and effective_adjustment:
+            try:
+                raw = self._normalize_history(
+                    self._call_with_timeout(
+                        lambda: ak.fund_etf_hist_sina(symbol=market_symbol), 12
+                    )
+                )
+                raw = raw[
+                    (raw["date"] >= pd.Timestamp(start))
+                    & (raw["date"] <= pd.Timestamp(end) + pd.Timedelta(days=1))
+                ]
+                dividends = self._call_with_timeout(
+                    lambda: ak.fund_etf_dividend_sina(symbol=market_symbol), 10
+                )
+                normalized = self._adjust_etf_history_locally(
+                    raw, dividends, effective_adjustment
+                )
+                if normalized.empty:
+                    raise RuntimeError("本地复权结果为空")
+                if persist:
+                    normalized.to_csv(path, index=False, encoding="utf-8-sig")
+                self.history_sources[security.key] = "新浪ETF日线 + 分红序列本地复权"
+                return (
+                    self._merge_live_daily_bar(
+                        security, normalized, effective_adjustment
+                    )
+                    if include_live
+                    else normalized
+                )
+            except Exception as exc:
+                errors.append(f"ETF分红序列本地复权: {exc}")
         if path.exists():
             cached = self._read_frame(path)
             if not cached.empty:
                 self.history_sources[security.key] = "过期本地缓存"
-                return self._merge_live_daily_bar(
-                    security, cached, effective_adjustment
-                ) if include_live else cached
+                return (
+                    self._merge_live_daily_bar(security, cached, effective_adjustment)
+                    if include_live
+                    else cached
+                )
         raise RuntimeError("所有日线接口均不可用：" + "；".join(errors))
+
+    @staticmethod
+    def _adjust_etf_history_locally(
+        history: pd.DataFrame, dividends: pd.DataFrame, adjustment: str
+    ) -> pd.DataFrame:
+        if history is None or history.empty or dividends is None or dividends.empty:
+            return pd.DataFrame()
+        date_column = next(
+            (name for name in ("日期", "date") if name in dividends), None
+        )
+        cumulative_column = next(
+            (name for name in ("累计分红", "累计派息", "分红") if name in dividends),
+            None,
+        )
+        if date_column is None or cumulative_column is None:
+            return pd.DataFrame()
+        result = history.copy().sort_values("date").reset_index(drop=True)
+        events = dividends[[date_column, cumulative_column]].copy()
+        events[date_column] = pd.to_datetime(events[date_column], errors="coerce")
+        events[cumulative_column] = pd.to_numeric(
+            events[cumulative_column], errors="coerce"
+        )
+        events = events.dropna().sort_values(date_column)
+        events["cash"] = (
+            events[cumulative_column].diff().fillna(events[cumulative_column])
+        )
+        factor = pd.Series(1.0, index=result.index)
+        for _, event in events.iterrows():
+            ex_date = pd.Timestamp(event[date_column]).normalize()
+            previous = result[result["date"] < ex_date]
+            if previous.empty:
+                continue
+            previous_close = _as_float(previous.iloc[-1].get("close"))
+            cash = _as_float(event.get("cash"))
+            if (
+                not previous_close
+                or cash is None
+                or cash <= 0
+                or cash >= previous_close
+            ):
+                continue
+            ratio = (previous_close - cash) / previous_close
+            if adjustment == "qfq":
+                factor.loc[result["date"] < ex_date] *= ratio
+            else:
+                factor.loc[result["date"] >= ex_date] /= ratio
+        for column in ("open", "close", "high", "low"):
+            result[column] = pd.to_numeric(result[column], errors="coerce") * factor
+        previous = result["close"].shift(1)
+        result["change"] = result["close"] - previous
+        result["pct_change"] = (result["close"] / previous - 1) * 100
+        result["amplitude"] = (result["high"] - result["low"]) / previous * 100
+        return result
 
     def get_detail_bundle(
         self,
@@ -956,11 +1345,26 @@ class DataProvider:
         bundle.sources["日线"] = self.history_sources.get(security.key, "未知")
         if not include_extras:
             return bundle
+        if security.security_type is SecurityType.ETF:
+            try:
+                bundle.corporate_actions = self._load_extra_with_cache(
+                    "corporate_actions",
+                    security.code,
+                    lambda: self._load_corporate_actions(security),
+                    timedelta(hours=24),
+                )
+                bundle.sources["corporate_actions"] = "AkShare·ETF分红"
+            except Exception:
+                bundle.warnings.append("ETF分红标注接口暂时不可用")
+            bundle.warnings.append("ETF不提供个股股东与企业财务披露数据。")
+            return bundle
         if security.security_type is not SecurityType.STOCK:
             bundle.warnings.append("ETF/指数不提供个股股东与筹码披露数据。")
             return bundle
 
-        extras: tuple[tuple[str, Callable[[], pd.DataFrame], str, timedelta, str], ...] = (
+        extras: tuple[
+            tuple[str, Callable[[], pd.DataFrame], str, timedelta, str], ...
+        ] = (
             (
                 "fund_flow",
                 lambda: self._load_fund_flow(security, history),
@@ -1003,11 +1407,22 @@ class DataProvider:
                 timedelta(hours=12),
                 "AkShare·同花顺/新浪财务",
             ),
+            (
+                "corporate_actions",
+                lambda: self._load_corporate_actions(security),
+                "除权除息与分红标注接口暂时不可用",
+                timedelta(hours=24),
+                "AkShare·分红送配",
+            ),
         )
         with ThreadPoolExecutor(max_workers=6) as executor:
             future_map = {
                 executor.submit(
-                    self._load_extra_with_cache, attribute, security.code, loader, max_age
+                    self._load_extra_with_cache,
+                    attribute,
+                    security.code,
+                    loader,
+                    max_age,
                 ): (attribute, warning, source)
                 for attribute, loader, warning, max_age, source in extras
             }
@@ -1015,13 +1430,84 @@ class DataProvider:
                 attribute, warning, source = future_map[future]
                 try:
                     frame = future.result()
-                    setattr(bundle, attribute, frame if frame is not None else pd.DataFrame())
+                    setattr(
+                        bundle,
+                        attribute,
+                        frame if frame is not None else pd.DataFrame(),
+                    )
                     bundle.sources[attribute] = str(
                         getattr(frame, "attrs", {}).get("source", source)
                     )
                 except Exception:
                     bundle.warnings.append(warning)
         return bundle
+
+    def _load_corporate_actions(self, security: Security) -> pd.DataFrame:
+        loaders: list[tuple[str, Callable[[], pd.DataFrame]]]
+        if security.security_type is SecurityType.ETF:
+            loaders = [
+                (
+                    "AkShare·新浪ETF分红",
+                    lambda: ak.fund_etf_dividend_sina(
+                        symbol=self._market_symbol(security)
+                    ),
+                )
+            ]
+        else:
+            loaders = [
+                (
+                    "AkShare·东方财富分红送配",
+                    lambda: ak.stock_fhps_detail_em(symbol=security.code),
+                ),
+                (
+                    "AkShare·巨潮分红",
+                    lambda: ak.stock_dividend_cninfo(symbol=security.code),
+                ),
+            ]
+        for source, loader in loaders:
+            try:
+                frame = self._call_with_timeout(loader, 10)
+                if frame is None or frame.empty:
+                    continue
+                date_column = next(
+                    (
+                        name
+                        for name in (
+                            "除权除息日",
+                            "除权日",
+                            "实施方案公告日期",
+                            "公告日期",
+                            "日期",
+                        )
+                        if name in frame
+                    ),
+                    None,
+                )
+                if date_column is None:
+                    continue
+                result = pd.DataFrame(
+                    {"date": pd.to_datetime(frame[date_column], errors="coerce")}
+                )
+                label_columns = [
+                    name
+                    for name in ("分红方案", "送转股份-送转总比例", "派息比例", "红利")
+                    if name in frame
+                ]
+                result["label"] = (
+                    frame[label_columns].astype(str).agg(" ".join, axis=1)
+                    if label_columns
+                    else "除权除息/分红"
+                )
+                result = (
+                    result.dropna(subset=["date"])
+                    .drop_duplicates("date")
+                    .sort_values("date")
+                )
+                result.attrs["source"] = source
+                return result.reset_index(drop=True)
+            except Exception:
+                continue
+        return pd.DataFrame(columns=["date", "label"])
 
     @staticmethod
     def _normalized_code(value: object) -> str:
@@ -1052,9 +1538,7 @@ class DataProvider:
         )
         if code_column is None:
             return pd.DataFrame()
-        matched = frame[
-            frame[code_column].map(self._normalized_code) == security.code
-        ]
+        matched = frame[frame[code_column].map(self._normalized_code) == security.code]
         if matched.empty:
             return pd.DataFrame()
         row = matched.iloc[0]
@@ -1078,7 +1562,9 @@ class DataProvider:
                     "日期": f"{beijing_today():%Y-%m-%d}",
                     "主力净流入-净额": main,
                     "主力净流入-净占比": ratio,
-                    "超大单净流入-净额": number("今日超大单净流入-净额", "超大单净流入-净额"),
+                    "超大单净流入-净额": number(
+                        "今日超大单净流入-净额", "超大单净流入-净额"
+                    ),
                     "大单净流入-净额": number("今日大单净流入-净额", "大单净流入-净额"),
                     "中单净流入-净额": number("今日中单净流入-净额", "中单净流入-净额"),
                     "小单净流入-净额": number("今日小单净流入-净额", "小单净流入-净额"),
@@ -1139,14 +1625,20 @@ class DataProvider:
             return pd.DataFrame()
         frame = history.copy().tail(120)
         span = (frame["high"] - frame["low"]).replace(0, np.nan)
-        multiplier = (((frame["close"] - frame["low"]) - (frame["high"] - frame["close"])) / span).fillna(0)
+        multiplier = (
+            ((frame["close"] - frame["low"]) - (frame["high"] - frame["close"])) / span
+        ).fillna(0)
         typical = (frame["high"] + frame["low"] + frame["close"]) / 3
         amount = pd.to_numeric(frame.get("amount"), errors="coerce")
-        amount = amount.where(amount > 0, typical * pd.to_numeric(frame["volume"], errors="coerce") * 100)
+        amount = amount.where(
+            amount > 0, typical * pd.to_numeric(frame["volume"], errors="coerce") * 100
+        )
         main = multiplier * amount
         return pd.DataFrame(
             {
-                "日期": pd.to_datetime(frame["date"], errors="coerce").dt.strftime("%Y-%m-%d"),
+                "日期": pd.to_datetime(frame["date"], errors="coerce").dt.strftime(
+                    "%Y-%m-%d"
+                ),
                 "主力净流入-净额": main,
                 "主力净流入-净占比": multiplier * 100,
                 "超大单净流入-净额": main * 0.35,
@@ -1319,7 +1811,9 @@ class DataProvider:
         for source, loader in loaders:
             try:
                 frame = self._normalize_history(self._call_with_timeout(loader, 10))
-                frame = frame[frame["date"].dt.date == trading_day].reset_index(drop=True)
+                frame = frame[frame["date"].dt.date == trading_day].reset_index(
+                    drop=True
+                )
                 if frame.empty:
                     raise RuntimeError("该日期无分时数据")
                 frame.to_csv(path, index=False, encoding="utf-8-sig")
@@ -1331,7 +1825,10 @@ class DataProvider:
         )
 
     def get_news(self, security: Security, force: bool = False) -> list[NewsArticle]:
-        path = self.cache_dir / f"news_v3_{security.security_type.value}_{security.code}.json"
+        path = (
+            self.cache_dir
+            / f"news_v3_{security.security_type.value}_{security.code}.json"
+        )
         if not force and self._cache_is_fresh(path, timedelta(minutes=10)):
             try:
                 values = json.loads(path.read_text(encoding="utf-8"))
@@ -1340,7 +1837,11 @@ class DataProvider:
                 pass
 
         articles: list[NewsArticle] = []
-        keyword = security.code if security.security_type is SecurityType.STOCK else security.name
+        keyword = (
+            security.code
+            if security.security_type is SecurityType.STOCK
+            else security.name
+        )
         try:
             frame = self._call_with_timeout(
                 lambda: ak.stock_news_em(symbol=keyword), 10
@@ -1393,6 +1894,68 @@ class DataProvider:
         )
         return deduplicated
 
+    def get_watchlist_notices(
+        self, securities: list[Security]
+    ) -> list[tuple[Security, NewsArticle]]:
+        """Load the current Beijing-date announcement feed once, then filter locally."""
+        stocks = {
+            item.code: item
+            for item in securities
+            if item.security_type is SecurityType.STOCK
+        }
+        if not stocks:
+            return []
+        day = beijing_today().strftime("%Y%m%d")
+        frame = self._load_extra_with_cache(
+            "market_notices",
+            day,
+            lambda: ak.stock_notice_report(symbol="全部", date=day),
+            timedelta(minutes=10),
+        )
+        code_column = next(
+            (name for name in ("代码", "股票代码", "证券代码") if name in frame), None
+        )
+        title_column = next(
+            (name for name in ("公告标题", "标题", "公告名称") if name in frame), None
+        )
+        if code_column is None or title_column is None:
+            return []
+        type_column = next(
+            (name for name in ("公告类型", "类型") if name in frame), None
+        )
+        date_column = next(
+            (name for name in ("公告日期", "公告时间", "日期") if name in frame), None
+        )
+        url_column = next(
+            (name for name in ("网址", "公告链接", "链接", "URL") if name in frame),
+            None,
+        )
+        result: list[tuple[Security, NewsArticle]] = []
+        for _, row in frame.iterrows():
+            code = self._normalized_code(row.get(code_column))
+            security = stocks.get(code)
+            if security is None:
+                continue
+            result.append(
+                (
+                    security,
+                    NewsArticle(
+                        title=self._clean_news_text(row.get(title_column)),
+                        summary=self._clean_news_text(row.get(type_column))
+                        if type_column
+                        else "",
+                        source="交易所公告",
+                        published_at=self._normalize_news_time(row.get(date_column))
+                        if date_column
+                        else "",
+                        url=self._clean_news_text(row.get(url_column))
+                        if url_column
+                        else "",
+                    ),
+                )
+            )
+        return result
+
     @staticmethod
     def _clean_news_text(value: object) -> str:
         text = re.sub(r"<[^>]+>", " ", str(value or ""))
@@ -1436,15 +1999,17 @@ class DataProvider:
         for item in root.findall(".//item"):
             source_node = item.find("source")
             link = item.findtext("link", "") or ""
-            source = source_node.text if source_node is not None else urlparse(link).netloc
+            source = (
+                source_node.text if source_node is not None else urlparse(link).netloc
+            )
             result.append(
                 NewsArticle(
                     title=self._clean_news_text(item.findtext("title", "")),
                     summary=self._short_news_text(item.findtext("description", "")),
-                    source=self._clean_news_text(
-                        source or "Bing 联网搜索"
+                    source=self._clean_news_text(source or "Bing 联网搜索"),
+                    published_at=self._normalize_news_time(
+                        item.findtext("pubDate", "")
                     ),
-                    published_at=self._normalize_news_time(item.findtext("pubDate", "")),
                     url=link,
                 )
             )
@@ -1530,12 +2095,15 @@ class DataProvider:
             if not cached.empty:
                 if source_path.exists():
                     try:
-                        cached.attrs["source"] = source_path.read_text(encoding="utf-8").strip()
+                        cached.attrs["source"] = source_path.read_text(
+                            encoding="utf-8"
+                        ).strip()
                     except OSError:
                         pass
                 return cached
         try:
-            frame = self._call_with_timeout(loader, 15)
+            timeout = 45 if name in {"market_breadth", "market_boards"} else 15
+            frame = self._call_with_timeout(loader, timeout)
             if frame is None or frame.empty:
                 raise RuntimeError("数据源返回空数据")
             frame.to_csv(path, index=False, encoding="utf-8-sig")
@@ -1548,14 +2116,18 @@ class DataProvider:
             if not cached.empty:
                 if source_path.exists():
                     try:
-                        cached.attrs["source"] = source_path.read_text(encoding="utf-8").strip()
+                        cached.attrs["source"] = source_path.read_text(
+                            encoding="utf-8"
+                        ).strip()
                     except OSError:
                         pass
                 return cached
             raise
 
     @staticmethod
-    def _call_with_timeout(loader: Callable[[], pd.DataFrame], seconds: float) -> pd.DataFrame:
+    def _call_with_timeout(
+        loader: Callable[[], pd.DataFrame], seconds: float
+    ) -> pd.DataFrame:
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="data-source")
         future = executor.submit(loader)
         try:
@@ -1608,21 +2180,26 @@ class DataProvider:
                 result[column] = np.nan
             result[column] = pd.to_numeric(result[column], errors="coerce")
         result = result.dropna(subset=["date", "open", "close", "high", "low"])
-        return result[
-            [
-                "date",
-                "open",
-                "close",
-                "high",
-                "low",
-                "volume",
-                "amount",
-                "amplitude",
-                "pct_change",
-                "change",
-                "turnover",
+        return (
+            result[
+                [
+                    "date",
+                    "open",
+                    "close",
+                    "high",
+                    "low",
+                    "volume",
+                    "amount",
+                    "amplitude",
+                    "pct_change",
+                    "change",
+                    "turnover",
+                ]
             ]
-        ].sort_values("date").drop_duplicates("date").reset_index(drop=True)
+            .sort_values("date")
+            .drop_duplicates("date")
+            .reset_index(drop=True)
+        )
 
     def _read_frame(self, path: Path) -> pd.DataFrame:
         try:

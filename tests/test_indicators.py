@@ -70,4 +70,3 @@ def test_rsi_stays_in_expected_range() -> None:
     result = calculate_indicators(sample_history())
     values = result["RSI_14"].dropna()
     assert values.between(0, 100).all()
-

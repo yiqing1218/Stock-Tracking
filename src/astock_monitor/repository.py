@@ -16,8 +16,12 @@ DEFAULT_WATCHLIST = [
 
 DEFAULT_FORMULAS = [
     CustomIndicator(None, "MACD动量差", "EMA(close, 12) - EMA(close, 26)", "#38BDF8"),
-    CustomIndicator(None, "20日价格偏离率", "(close / SMA(close, 20) - 1) * 100", "#F59E0B"),
-    CustomIndicator(None, "量价共振", "ZSCORE(returns, 20) + ZSCORE(volume, 20)", "#A78BFA"),
+    CustomIndicator(
+        None, "20日价格偏离率", "(close / SMA(close, 20) - 1) * 100", "#F59E0B"
+    ),
+    CustomIndicator(
+        None, "量价共振", "ZSCORE(returns, 20) + ZSCORE(volume, 20)", "#A78BFA"
+    ),
 ]
 
 
@@ -68,19 +72,58 @@ class Repository:
                     indicator_key TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    security_type TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL DEFAULT '',
+                    source_url TEXT NOT NULL DEFAULT '',
+                    external_key TEXT NOT NULL UNIQUE,
+                    published_at TEXT NOT NULL DEFAULT '',
+                    is_read INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS market_alert_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    security_type TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    rule_type TEXT NOT NULL,
+                    threshold REAL,
+                    secondary_threshold REAL,
+                    window_minutes INTEGER NOT NULL DEFAULT 5,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_state TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(security_type, code, rule_type)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_notifications_unread
+                ON notifications(is_read, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled
+                ON market_alert_rules(enabled, security_type, code);
                 """
             )
             connection.execute(
                 "INSERT OR IGNORE INTO watchlist_groups (name, sort_order) VALUES ('默认分组', 0)"
             )
             columns = {
-                row["name"] for row in connection.execute("PRAGMA table_info(watchlist)").fetchall()
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(watchlist)").fetchall()
             }
             if "group_id" not in columns:
                 connection.execute("ALTER TABLE watchlist ADD COLUMN group_id INTEGER")
             custom_columns = {
                 row["name"]
-                for row in connection.execute("PRAGMA table_info(custom_indicators)").fetchall()
+                for row in connection.execute(
+                    "PRAGMA table_info(custom_indicators)"
+                ).fetchall()
             }
             if "category" not in custom_columns:
                 connection.execute(
@@ -92,7 +135,8 @@ class Repository:
                 )
             default_group_id = self._default_group_id(connection)
             connection.execute(
-                "UPDATE watchlist SET group_id = ? WHERE group_id IS NULL", (default_group_id,)
+                "UPDATE watchlist SET group_id = ? WHERE group_id IS NULL",
+                (default_group_id,),
             )
             count = connection.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0]
             if count == 0:
@@ -121,7 +165,13 @@ class Repository:
                         INSERT OR IGNORE INTO custom_indicators
                         (name, formula, color, category, in_library) VALUES (?, ?, ?, ?, ?)
                         """,
-                        (item.name, item.formula, item.color, item.category, int(item.in_library)),
+                        (
+                            item.name,
+                            item.formula,
+                            item.color,
+                            item.category,
+                            int(item.in_library),
+                        ),
                     )
 
     @staticmethod
@@ -141,7 +191,10 @@ class Repository:
             rows = connection.execute(
                 "SELECT id, name, sort_order FROM watchlist_groups ORDER BY sort_order, id"
             ).fetchall()
-        return [WatchlistGroup(int(row["id"]), row["name"], int(row["sort_order"])) for row in rows]
+        return [
+            WatchlistGroup(int(row["id"]), row["name"], int(row["sort_order"]))
+            for row in rows
+        ]
 
     def create_group(self, name: str) -> WatchlistGroup:
         name = name.strip()
@@ -179,7 +232,8 @@ class Repository:
             if group_id == default_id:
                 raise ValueError("默认分组不能删除")
             connection.execute(
-                "UPDATE watchlist SET group_id = ? WHERE group_id = ?", (default_id, group_id)
+                "UPDATE watchlist SET group_id = ? WHERE group_id = ?",
+                (default_id, group_id),
             )
             connection.execute("DELETE FROM watchlist_groups WHERE id = ?", (group_id,))
 
@@ -386,7 +440,9 @@ class Repository:
 
     def delete_custom_indicator(self, indicator_id: int) -> None:
         with self._connect() as connection:
-            connection.execute("DELETE FROM custom_indicators WHERE id = ?", (indicator_id,))
+            connection.execute(
+                "DELETE FROM custom_indicators WHERE id = ?", (indicator_id,)
+            )
             connection.execute(
                 "DELETE FROM indicator_favorites WHERE indicator_key = ?",
                 (f"custom:{indicator_id}",),
@@ -413,3 +469,144 @@ class Repository:
                 connection.execute(
                     "DELETE FROM indicator_favorites WHERE indicator_key = ?", (key,)
                 )
+
+    def add_notification(
+        self,
+        security: Security,
+        event_type: str,
+        title: str,
+        *,
+        content: str = "",
+        source_url: str = "",
+        external_key: str,
+        published_at: str = "",
+    ) -> bool:
+        """Insert one compact event and return whether it was new."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO notifications
+                (security_type, code, name, event_type, title, content, source_url,
+                 external_key, published_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    security.security_type.value,
+                    security.code,
+                    security.name,
+                    event_type,
+                    title.strip(),
+                    content.strip(),
+                    source_url.strip(),
+                    external_key.strip(),
+                    published_at.strip(),
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def list_notifications(
+        self, unread_only: bool = False, limit: int = 500
+    ) -> list[dict]:
+        where = "WHERE is_read = 0" if unread_only else ""
+        safe_limit = max(1, min(int(limit), 2000))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM notifications {where}
+                ORDER BY CASE WHEN published_at = '' THEN created_at ELSE published_at END DESC,
+                         id DESC LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def unread_notification_count(self) -> int:
+        with self._connect() as connection:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM notifications WHERE is_read = 0"
+                ).fetchone()[0]
+            )
+
+    def mark_notification_read(self, notification_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE notifications SET is_read = 1 WHERE id = ?", (notification_id,)
+            )
+
+    def mark_all_notifications_read(self) -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE notifications SET is_read = 1 WHERE is_read = 0")
+
+    def list_market_alert_rules(
+        self,
+        security: Security | None = None,
+        enabled_only: bool = False,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if security is not None:
+            clauses.extend(["security_type = ?", "code = ?"])
+            parameters.extend([security.security_type.value, security.code])
+        if enabled_only:
+            clauses.append("enabled = 1")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM market_alert_rules {where} ORDER BY name, rule_type",
+                tuple(parameters),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_market_alert_rule(
+        self,
+        security: Security,
+        rule_type: str,
+        threshold: float | None = None,
+        secondary_threshold: float | None = None,
+        window_minutes: int = 5,
+        enabled: bool = True,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO market_alert_rules
+                (security_type, code, name, rule_type, threshold, secondary_threshold,
+                 window_minutes, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(security_type, code, rule_type) DO UPDATE SET
+                    name = excluded.name,
+                    threshold = excluded.threshold,
+                    secondary_threshold = excluded.secondary_threshold,
+                    window_minutes = excluded.window_minutes,
+                    enabled = excluded.enabled,
+                    last_state = '',
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    security.security_type.value,
+                    security.code,
+                    security.name,
+                    rule_type,
+                    threshold,
+                    secondary_threshold,
+                    max(1, min(int(window_minutes), 120)),
+                    int(enabled),
+                ),
+            )
+
+    def delete_market_alert_rule(self, rule_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM market_alert_rules WHERE id = ?", (rule_id,)
+            )
+
+    def update_market_alert_state(self, rule_id: int, state: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE market_alert_rules SET last_state = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (state[:64], rule_id),
+            )

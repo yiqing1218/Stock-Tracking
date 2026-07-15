@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from .analytics_widgets import ChipDistributionWidget, FinancialChartWidget
+from .alerts import AlertSettingsWidget
 from .chart_widget import MarketChart
 from .data_provider import DataProvider, DetailBundle
 from .formula_engine import FORMULA_HELP, FormulaEngine, FormulaError
@@ -161,12 +162,14 @@ class DetailPage(QWidget):
         self.fundamentals_tab = self._build_fundamentals_tab()
         self.news_tab = self._build_news_tab()
         self.custom_tab = self._build_custom_tab()
+        self.alert_settings_tab = AlertSettingsWidget(self.repository)
         self.tabs.addTab(self.overview_tab, "行情走势")
         self.tabs.addTab(self.intraday_tab, "历史分时")
         self.tabs.addTab(self.indicators_tab, "全部指标")
         self.tabs.addTab(self.fundamentals_tab, "资金、筹码与公司")
         self.tabs.addTab(self.news_tab, "实时资讯")
         self.tabs.addTab(self.custom_tab, "自定义指标")
+        self.tabs.addTab(self.alert_settings_tab, "行情提醒设置")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
 
@@ -269,10 +272,16 @@ class DetailPage(QWidget):
         self.signal_table = QTableWidget(0, 3)
         self.signal_table.setHorizontalHeaderLabels(["维度", "指标", "状态"])
         configure_table(self.signal_table, alternating=False)
-        self.signal_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.signal_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
         self.signal_table.verticalHeader().setDefaultSectionSize(36)
-        self.signal_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.signal_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.signal_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.signal_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.signal_table.setMinimumHeight(260)
         insight_layout.addWidget(self.signal_table)
         note = QLabel("状态摘要仅用于把多类指标放在同一语境中，不代表确定性预测。")
@@ -352,7 +361,9 @@ class DetailPage(QWidget):
             cards.addWidget(card)
         layout.addLayout(cards)
 
-        self.company_status = QLabel("资金、筹码、股东与企业财务数据仅在相应证券具备公开披露时展示。")
+        self.company_status = QLabel(
+            "资金、筹码、股东与企业财务数据仅在相应证券具备公开披露时展示。"
+        )
         self.company_status.setObjectName("Muted")
         layout.addWidget(self.company_status)
 
@@ -361,12 +372,24 @@ class DetailPage(QWidget):
         self.fundamental_navigation = QButtonGroup(self)
         self.fundamental_navigation.setExclusive(True)
         self.fundamental_stack = QStackedWidget()
-        for index, label in enumerate(("主力资金", "筹码分布", "主要股东", "企业概况", "主营业务", "财务信息")):
+        for index, label in enumerate(
+            (
+                "主力资金",
+                "筹码分布",
+                "主要股东",
+                "企业概况",
+                "主营业务",
+                "财务信息",
+                "F10深度",
+            )
+        ):
             button = QPushButton(label)
             button.setObjectName("SubNavigation")
             button.setCheckable(True)
             button.setChecked(index == 0)
-            button.clicked.connect(lambda checked=False, page=index: self._select_fundamental_page(page))
+            button.clicked.connect(
+                lambda checked=False, page=index: self._select_fundamental_page(page)
+            )
             self.fundamental_navigation.addButton(button, index)
             navigation.addWidget(button)
         navigation.addStretch(1)
@@ -381,7 +404,9 @@ class DetailPage(QWidget):
             ["日期", "主力净额", "主力占比", "超大单", "大单", "中单", "小单"]
         )
         configure_table(self.flow_table)
-        self.flow_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.flow_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
         flow_layout.addWidget(self.flow_table)
         self.fundamental_stack.addWidget(flow_page)
 
@@ -396,7 +421,9 @@ class DetailPage(QWidget):
             ["日期", "获利比例", "平均成本", "90%成本区间", "70%成本区间", "90%集中度"]
         )
         configure_table(self.chip_table)
-        self.chip_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.chip_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
         chip_splitter.addWidget(self.chip_table)
         chip_splitter.setStretchFactor(0, 2)
         chip_splitter.setStretchFactor(1, 3)
@@ -417,7 +444,9 @@ class DetailPage(QWidget):
         holder_header = self.holder_table.horizontalHeader()
         holder_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for index in range(1, 6):
-            holder_header.setSectionResizeMode(index, QHeaderView.ResizeMode.ResizeToContents)
+            holder_header.setSectionResizeMode(
+                index, QHeaderView.ResizeMode.ResizeToContents
+            )
         holder_layout.addWidget(self.holder_table)
         self.fundamental_stack.addWidget(holder_page)
 
@@ -428,8 +457,12 @@ class DetailPage(QWidget):
         self.company_table = QTableWidget(0, 2)
         self.company_table.setHorizontalHeaderLabels(["项目", "内容"])
         configure_table(self.company_table)
-        self.company_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.company_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.company_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.company_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
         company_layout.addWidget(self.company_table)
         self.fundamental_stack.addWidget(company_page)
 
@@ -456,6 +489,27 @@ class DetailPage(QWidget):
         finance_splitter.setStretchFactor(1, 3)
         finance_layout.addWidget(finance_splitter)
         self.fundamental_stack.addWidget(finance_page)
+
+        f10_page = QWidget()
+        f10_layout = QVBoxLayout(f10_page)
+        f10_layout.setContentsMargins(0, 0, 0, 0)
+        f10_layout.addWidget(
+            section_title(
+                "F10深度分析", "盈利、成长、偿债、现金流与风险线索的披露数据归纳"
+            )
+        )
+        self.f10_notes = QTextEdit()
+        self.f10_notes.setReadOnly(True)
+        self.f10_notes.setMaximumHeight(170)
+        self.f10_table = QTableWidget(0, 4)
+        self.f10_table.setHorizontalHeaderLabels(["维度", "代表指标", "最新值", "判断"])
+        configure_table(self.f10_table)
+        self.f10_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        f10_layout.addWidget(self.f10_notes)
+        f10_layout.addWidget(self.f10_table, 1)
+        self.fundamental_stack.addWidget(f10_page)
 
         layout.addWidget(self.fundamental_stack, 1)
         return tab
@@ -484,7 +538,9 @@ class DetailPage(QWidget):
         news_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.news_table.cellDoubleClicked.connect(self._open_news)
         layout.addWidget(self.news_table, 1)
-        note = QLabel("双击资讯打开原文。条目来自东方财富个股新闻和联网新闻搜索，标题相同的内容会自动去重。")
+        note = QLabel(
+            "双击资讯打开原文。条目来自东方财富个股新闻和联网新闻搜索，标题相同的内容会自动去重。"
+        )
         note.setObjectName("Tiny")
         layout.addWidget(note)
         return tab
@@ -499,7 +555,9 @@ class DetailPage(QWidget):
         self.indicator_search.setClearButtonEnabled(True)
         self.indicator_search.textChanged.connect(self._filter_indicators)
         self.indicator_category = QComboBox()
-        self.indicator_category.addItems(["全部分类", "趋势", "动量", "波动", "量能", "情绪", "风险"])
+        self.indicator_category.addItems(
+            ["全部分类", "趋势", "动量", "波动", "量能", "情绪", "风险"]
+        )
         self.indicator_category.currentIndexChanged.connect(self._filter_indicators)
         self.indicator_count = QLabel("0 项")
         self.indicator_count.setObjectName("Muted")
@@ -527,7 +585,9 @@ class DetailPage(QWidget):
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(6, 58)
         layout.addWidget(self.indicator_table, 1)
-        note = QLabel("指标采用公开 OHLCV/成交额/换手率数据计算；均线和波动指标具有滞后性，应结合市场环境使用。")
+        note = QLabel(
+            "指标采用公开 OHLCV/成交额/换手率数据计算；均线和波动指标具有滞后性，应结合市场环境使用。"
+        )
         note.setObjectName("Tiny")
         layout.addWidget(note)
         return tab
@@ -558,7 +618,9 @@ class DetailPage(QWidget):
         editor = QFrame()
         editor.setObjectName("Section")
         editor_layout = QVBoxLayout(editor)
-        editor_layout.addWidget(section_title("公式编辑器", "基于当前证券的全部基础行情变量"))
+        editor_layout.addWidget(
+            section_title("公式编辑器", "基于当前证券的全部基础行情变量")
+        )
         name_row = QHBoxLayout()
         name_row.addWidget(QLabel("名称"))
         self.formula_name = QLineEdit()
@@ -571,7 +633,9 @@ class DetailPage(QWidget):
         self.formula_category.addItems(["趋势", "动量", "波动", "量能", "情绪", "风险"])
         classification_row.addWidget(self.formula_category)
         self.formula_in_library = QCheckBox("加入全部指标库")
-        self.formula_in_library.setToolTip("加入后会出现在“全部指标”，并参与对应维度的综合状态")
+        self.formula_in_library.setToolTip(
+            "加入后会出现在“全部指标”，并参与对应维度的综合状态"
+        )
         classification_row.addWidget(self.formula_in_library)
         classification_row.addStretch(1)
         editor_layout.addLayout(classification_row)
@@ -580,7 +644,9 @@ class DetailPage(QWidget):
         self.formula_edit.setPlaceholderText("例如：(close / SMA(close, 20) - 1) * 100")
         self.formula_edit.setMaximumHeight(92)
         editor_layout.addWidget(self.formula_edit)
-        help_text = "\n".join(f"{title}：{value}" for title, value in FORMULA_HELP.items())
+        help_text = "\n".join(
+            f"{title}：{value}" for title, value in FORMULA_HELP.items()
+        )
         self.formula_help = QLabel(help_text)
         self.formula_help.setObjectName("Tiny")
         self.formula_help.setWordWrap(True)
@@ -616,6 +682,7 @@ class DetailPage(QWidget):
         """Keep the full analysis workspace visible without fabricating a security."""
 
         self.security = None
+        self.alert_settings_tab.set_security(None)
         self.bundle = None
         self.indicator_frame = pd.DataFrame()
         self.snapshots = []
@@ -670,11 +737,14 @@ class DetailPage(QWidget):
             self.concentration_card,
         ):
             card.set_value("—", "等待选择自选证券")
-        self.regime_summary.setText("从自选股票进入后，这里会显示加权六维评价与行情解读。")
+        self.regime_summary.setText(
+            "从自选股票进入后，这里会显示加权六维评价与行情解读。"
+        )
         self.tabs.setCurrentWidget(self.overview_tab)
 
     def load_security(self, security: Security) -> None:
         self.security = security
+        self.alert_settings_tab.set_security(security)
         self.bundle = None
         self.indicator_frame = pd.DataFrame()
         self.snapshots = []
@@ -697,12 +767,16 @@ class DetailPage(QWidget):
         self.intraday_button.setEnabled(True)
         self.news_refresh_button.setEnabled(True)
         self.security_name.setText(security.name)
-        self.security_code.setText(f"{security.display_code} · {security.security_type.label}")
+        self.security_code.setText(
+            f"{security.display_code} · {security.security_type.label}"
+        )
         self.price_label.setText("—")
         self.change_label.setText("—")
         self.loading_label.setText("正在优先加载行情；资金、公司和扩展指标按需加载…")
         self.refresh_button.setEnabled(False)
-        self.adjustment_combo.setEnabled(security.security_type is not SecurityType.INDEX)
+        self.adjustment_combo.setEnabled(
+            security.security_type is not SecurityType.INDEX
+        )
         today = beijing_today()
         beijing_qdate = QDate(today.year, today.month, today.day)
         self.intraday_date.setMaximumDate(beijing_qdate)
@@ -750,7 +824,9 @@ class DetailPage(QWidget):
         self._rebuild_indicator_library()
         warnings = "；".join(bundle.warnings)
         history_source = bundle.sources.get("日线", "未知来源")
-        self.loading_label.setText(f"已加载 {len(calculated)} 个交易日 · {history_source}")
+        self.loading_label.setText(
+            f"已加载 {len(calculated)} 个交易日 · {history_source}"
+        )
         self.loading_label.setToolTip(warnings)
         self._update_header()
         self._update_overview()
@@ -777,9 +853,13 @@ class DetailPage(QWidget):
             lambda result, current=token: self._on_detail_extras(current, result)
         )
         worker.signals.error.connect(
-            lambda message, current=token: self._on_detail_extras_error(current, message)
+            lambda message, current=token: self._on_detail_extras_error(
+                current, message
+            )
         )
-        self._start_worker(worker, lambda current=token: self._finish_detail_extras(current))
+        self._start_worker(
+            worker, lambda current=token: self._finish_detail_extras(current)
+        )
 
     def _on_detail_extras(self, token: int, result: object) -> None:
         if token != self._load_token or not isinstance(result, DetailBundle):
@@ -787,6 +867,7 @@ class DetailPage(QWidget):
         self.bundle = result
         self._populate_capital()
         self._populate_company()
+        self._update_charts()
 
     def _on_detail_extras_error(self, token: int, message: str) -> None:
         if token != self._load_token:
@@ -825,9 +906,13 @@ class DetailPage(QWidget):
         )
         worker.signals.result.connect(self._on_extended_indicators_loaded)
         worker.signals.error.connect(
-            lambda message, current=token: self._on_extended_indicators_error(current, message)
+            lambda message, current=token: self._on_extended_indicators_error(
+                current, message
+            )
         )
-        self._start_worker(worker, lambda current=token: self._finish_extended_indicators(current))
+        self._start_worker(
+            worker, lambda current=token: self._finish_extended_indicators(current)
+        )
 
     def _load_extended_indicator_snapshots(
         self,
@@ -898,9 +983,7 @@ class DetailPage(QWidget):
                 for item in snapshots
             ],
         }
-        cache_path.write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-        )
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return token, snapshots
 
     def _on_extended_indicators_loaded(self, result: object) -> None:
@@ -951,9 +1034,15 @@ class DetailPage(QWidget):
         if self.indicator_frame.empty:
             return
         last = self.indicator_frame.iloc[-1]
-        previous_close = float(self.indicator_frame.iloc[-2]["close"]) if len(self.indicator_frame) > 1 else float("nan")
+        previous_close = (
+            float(self.indicator_frame.iloc[-2]["close"])
+            if len(self.indicator_frame) > 1
+            else float("nan")
+        )
         close = float(last["close"])
-        change = close - previous_close if math.isfinite(previous_close) else float("nan")
+        change = (
+            close - previous_close if math.isfinite(previous_close) else float("nan")
+        )
         change_pct = change / previous_close * 100 if previous_close else float("nan")
         color = change_color(change_pct)
         self.price_label.setText(f"{close:.2f}")
@@ -977,7 +1066,10 @@ class DetailPage(QWidget):
         if adjustment == self._adjustment:
             return
         self._adjustment = adjustment
-        if self.security is not None and self.security.security_type is not SecurityType.INDEX:
+        if (
+            self.security is not None
+            and self.security.security_type is not SecurityType.INDEX
+        ):
             self.load_security(self.security)
 
     def _open_intraday_for_date(self, trading_day: object) -> None:
@@ -990,9 +1082,7 @@ class DetailPage(QWidget):
         today = beijing_today()
         if selected > today:
             selected = today
-        self.intraday_date.setDate(
-            QDate(selected.year, selected.month, selected.day)
-        )
+        self.intraday_date.setDate(QDate(selected.year, selected.month, selected.day))
         period_index = self.intraday_period.findData("1")
         self.intraday_period.setCurrentIndex(max(0, period_index))
         self.tabs.setCurrentWidget(self.intraday_tab)
@@ -1011,7 +1101,10 @@ class DetailPage(QWidget):
             market_frame = calculate_indicators(market_history, include_extended=False)
         else:
             market_frame = self._visible_frame()
-        self.market_chart.set_data(market_frame)
+        markers = (
+            self.bundle.corporate_actions if self.bundle is not None else pd.DataFrame()
+        )
+        self.market_chart.set_data(market_frame, event_markers=markers)
         visible = self._visible_frame()
         if self.custom_series is not None:
             series = self.custom_series.reindex(visible.index)
@@ -1024,12 +1117,26 @@ class DetailPage(QWidget):
             return
         self._update_charts()
         regime = market_regime(self.indicator_frame)
-        regime_color = UP_COLOR if regime["direction"] == "偏多" else DOWN_COLOR if regime["direction"] == "偏空" else None
+        regime_color = (
+            UP_COLOR
+            if regime["direction"] == "偏多"
+            else DOWN_COLOR
+            if regime["direction"] == "偏空"
+            else None
+        )
         adx = self._last_value("ADX_14")
-        self.regime_card.set_value(str(regime["regime"]), f"ADX {adx:.1f}" if adx is not None else "ADX —", regime_color)
-        self.score_card.set_value(f"{float(regime['score']):.0f}/100", str(regime["direction"]), regime_color)
+        self.regime_card.set_value(
+            str(regime["regime"]),
+            f"ADX {adx:.1f}" if adx is not None else "ADX —",
+            regime_color,
+        )
+        self.score_card.set_value(
+            f"{float(regime['score']):.0f}/100", str(regime["direction"]), regime_color
+        )
         hv = self._last_value("HV_20")
-        self.volatility_card.set_value(format_percent(hv, signed=False), "日收益年化标准差")
+        self.volatility_card.set_value(
+            format_percent(hv, signed=False), "日收益年化标准差"
+        )
         drawdown = self._last_value("DRAWDOWN")
         self.drawdown_card.set_value(format_percent(drawdown), "相对历史最高收盘")
         self.regime_summary.setText(
@@ -1058,14 +1165,20 @@ class DetailPage(QWidget):
         self.indicator_table.setRowCount(len(self.snapshots))
         for row, snapshot in enumerate(self.snapshots):
             definition = snapshot.definition
-            value = "—" if snapshot.value is None else f"{snapshot.value:.4f}".rstrip("0").rstrip(".")
+            value = (
+                "—"
+                if snapshot.value is None
+                else f"{snapshot.value:.4f}".rstrip("0").rstrip(".")
+            )
             if value != "—" and definition.unit:
                 value += definition.unit
             self.indicator_table.setItem(row, 0, QTableWidgetItem(definition.category))
             self.indicator_table.setItem(row, 1, QTableWidgetItem(definition.name))
             self.indicator_table.setItem(row, 2, QTableWidgetItem(definition.origin))
             value_item = QTableWidgetItem(value)
-            value_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
             self.indicator_table.setItem(row, 3, value_item)
             self.indicator_table.setCellWidget(row, 4, StatusPill(snapshot.status))
             description = QTableWidgetItem(detailed_indicator_description(definition))
@@ -1079,8 +1192,8 @@ class DetailPage(QWidget):
             button.setChecked(favorite)
             button.setToolTip("取消关注" if favorite else "关注该指标")
             button.toggled.connect(
-                lambda checked=False, key=identifier, control=button: self._toggle_indicator_favorite(
-                    key, checked, control
+                lambda checked=False, key=identifier, control=button: (
+                    self._toggle_indicator_favorite(key, checked, control)
                 )
             )
             self.indicator_table.setCellWidget(row, 6, button)
@@ -1091,7 +1204,9 @@ class DetailPage(QWidget):
             self.snapshots = []
             return
         custom_columns = [
-            column for column in self.indicator_frame if str(column).startswith("CUSTOM_")
+            column
+            for column in self.indicator_frame
+            if str(column).startswith("CUSTOM_")
         ]
         if custom_columns:
             self.indicator_frame = self.indicator_frame.drop(columns=custom_columns)
@@ -1129,7 +1244,12 @@ class DetailPage(QWidget):
         shown = 0
         for row, snapshot in enumerate(self.snapshots):
             definition = snapshot.definition
-            matches_query = not query or query in definition.name.lower() or query in definition.description.lower() or query in definition.column.lower()
+            matches_query = (
+                not query
+                or query in definition.name.lower()
+                or query in definition.description.lower()
+                or query in definition.column.lower()
+            )
             matches_category = category == "全部分类" or category == definition.category
             matches_favorite = (
                 not favorites_only or definition.identifier in self.indicator_favorites
@@ -1171,7 +1291,11 @@ class DetailPage(QWidget):
         self.main_flow_card.subtitle_label.setText(
             f"{self.main_flow_card.subtitle_label.text()}\n{flow_source}"
         )
-        for card in (self.profit_ratio_card, self.average_cost_card, self.concentration_card):
+        for card in (
+            self.profit_ratio_card,
+            self.average_cost_card,
+            self.concentration_card,
+        ):
             card.subtitle_label.setText(f"{card.subtitle_label.text()}\n{chip_source}")
         latest_price = None
         if not self.indicator_frame.empty:
@@ -1206,13 +1330,17 @@ class DetailPage(QWidget):
                     text = format_number(self._number(raw))
                 item = QTableWidgetItem(text)
                 if column_index > 0:
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
                     item.setForeground(QColor(change_color(self._number(raw))))
                 self.flow_table.setItem(row_index, column_index, item)
         latest = frame.iloc[-1]
         main = self._number(latest.get("主力净流入-净额"))
         ratio = self._number(latest.get("主力净流入-净占比"))
-        self.main_flow_card.set_value(format_number(main), format_percent(ratio), change_color(main))
+        self.main_flow_card.set_value(
+            format_number(main), format_percent(ratio), change_color(main)
+        )
 
     def _populate_chips(self, frame: pd.DataFrame) -> None:
         self.chip_table.setRowCount(0)
@@ -1227,24 +1355,36 @@ class DetailPage(QWidget):
         for row_index, row in data.iterrows():
             values = [
                 str(row.get("日期", "")),
-                format_percent((self._number(row.get("获利比例")) or 0) * 100, signed=False),
+                format_percent(
+                    (self._number(row.get("获利比例")) or 0) * 100, signed=False
+                ),
                 format_number(self._number(row.get("平均成本"))),
                 f"{format_number(self._number(row.get('90成本-低')))} - {format_number(self._number(row.get('90成本-高')))}",
                 f"{format_number(self._number(row.get('70成本-低')))} - {format_number(self._number(row.get('70成本-高')))}",
-                format_percent((self._number(row.get("90集中度")) or 0) * 100, signed=False),
+                format_percent(
+                    (self._number(row.get("90集中度")) or 0) * 100, signed=False
+                ),
             ]
             for column_index, text in enumerate(values):
                 item = QTableWidgetItem(text)
                 if column_index > 0:
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
                 self.chip_table.setItem(row_index, column_index, item)
         latest = frame.iloc[-1]
         profit_ratio = (self._number(latest.get("获利比例")) or 0) * 100
         average_cost = self._number(latest.get("平均成本"))
         concentration = (self._number(latest.get("90集中度")) or 0) * 100
-        self.profit_ratio_card.set_value(format_percent(profit_ratio, signed=False), "估算获利筹码占比")
-        self.average_cost_card.set_value(format_number(average_cost), "筹码重建平均成本")
-        self.concentration_card.set_value(format_percent(concentration, signed=False), "越低通常越集中")
+        self.profit_ratio_card.set_value(
+            format_percent(profit_ratio, signed=False), "估算获利筹码占比"
+        )
+        self.average_cost_card.set_value(
+            format_number(average_cost), "筹码重建平均成本"
+        )
+        self.concentration_card.set_value(
+            format_percent(concentration, signed=False), "越低通常越集中"
+        )
 
     def _populate_holders(self, frame: pd.DataFrame) -> None:
         self.holder_table.setRowCount(0)
@@ -1268,7 +1408,9 @@ class DetailPage(QWidget):
                 str(row.get("公告日期", "")),
             ]
             for column_index, text in enumerate(values):
-                self.holder_table.setItem(row_index, column_index, QTableWidgetItem(text))
+                self.holder_table.setItem(
+                    row_index, column_index, QTableWidgetItem(text)
+                )
 
     def _populate_company(self) -> None:
         self.company_table.setRowCount(0)
@@ -1277,7 +1419,9 @@ class DetailPage(QWidget):
         if self.bundle is None or self.security is None:
             return
         if self.security.security_type is not SecurityType.STOCK:
-            self.company_status.setText("ETF和指数没有单一上市公司的股东、筹码、企业概况与财务报表。")
+            self.company_status.setText(
+                "ETF和指数没有单一上市公司的股东、筹码、企业概况与财务报表。"
+            )
             self.financial_chart.set_data(pd.DataFrame())
             return
         self.company_status.setText(
@@ -1290,10 +1434,20 @@ class DetailPage(QWidget):
         if frame is not None and not frame.empty:
             for _, row in frame.iterrows():
                 if "item" in frame.columns and "value" in frame.columns:
-                    pairs.append((self._display_value(row.get("item")), self._display_value(row.get("value"))))
+                    pairs.append(
+                        (
+                            self._display_value(row.get("item")),
+                            self._display_value(row.get("value")),
+                        )
+                    )
                     continue
                 if "项目" in frame.columns and "值" in frame.columns:
-                    pairs.append((self._display_value(row.get("项目")), self._display_value(row.get("值"))))
+                    pairs.append(
+                        (
+                            self._display_value(row.get("项目")),
+                            self._display_value(row.get("值")),
+                        )
+                    )
                     continue
                 for column in frame.columns:
                     value = self._display_value(row.get(column))
@@ -1311,9 +1465,78 @@ class DetailPage(QWidget):
         for row_index, (name, value) in enumerate(unique_pairs):
             self.company_table.setItem(row_index, 0, QTableWidgetItem(name))
             self.company_table.setItem(row_index, 1, QTableWidgetItem(value))
-        self._fill_frame_table(self.business_table, self.bundle.business_info, max_rows=80)
-        self._fill_frame_table(self.financial_table, self.bundle.financials, max_rows=80)
+        self._fill_frame_table(
+            self.business_table, self.bundle.business_info, max_rows=80
+        )
+        self._fill_frame_table(
+            self.financial_table, self.bundle.financials, max_rows=80
+        )
         self.financial_chart.set_data(self.bundle.financials)
+        self._populate_f10(self.bundle.financials)
+
+    def _populate_f10(self, frame: pd.DataFrame) -> None:
+        self.f10_table.setRowCount(0)
+        if frame is None or frame.empty:
+            self.f10_notes.setPlainText("暂无足够财务披露，无法生成F10深度分析。")
+            return
+        dimensions = {
+            "盈利能力": ("净资产收益率", "ROE", "净利率", "毛利率"),
+            "成长能力": ("营业收入同比", "净利润同比", "营收增长", "利润增长"),
+            "偿债能力": ("资产负债率", "流动比率", "速动比率"),
+            "现金流质量": ("经营活动现金流", "每股经营现金流", "现金流量净额"),
+        }
+        rows: list[tuple[str, str, str, str]] = []
+        for dimension, keywords in dimensions.items():
+            match = next(
+                (
+                    str(column)
+                    for column in frame.columns
+                    if any(key.lower() in str(column).lower() for key in keywords)
+                ),
+                None,
+            )
+            if match is None:
+                continue
+            values = pd.to_numeric(frame[match], errors="coerce").dropna()
+            if values.empty:
+                continue
+            latest = float(values.iloc[-1])
+            if len(values) >= 2:
+                judgment = (
+                    "改善"
+                    if latest > float(values.iloc[-2])
+                    else "走弱"
+                    if latest < float(values.iloc[-2])
+                    else "持平"
+                )
+            else:
+                judgment = "仅一期数据"
+            rows.append((dimension, match, format_number(latest), judgment))
+        self.f10_table.setRowCount(len(rows))
+        for row_index, values in enumerate(rows):
+            for column, value in enumerate(values):
+                self.f10_table.setItem(row_index, column, QTableWidgetItem(value))
+        warnings: list[str] = []
+        for column in frame.columns:
+            name = str(column)
+            values = pd.to_numeric(frame[column], errors="coerce").dropna()
+            if values.empty:
+                continue
+            latest = float(values.iloc[-1])
+            if "资产负债率" in name and latest > 70:
+                warnings.append("资产负债率偏高，需结合行业属性和有息负债继续核查。")
+            if ("经营" in name and "现金" in name) and latest < 0:
+                warnings.append("最近一期经营现金流为负，需核对利润的现金含量。")
+        summary = (
+            "；".join(warnings)
+            if warnings
+            else "未从现有披露指标中发现简单阈值型高风险信号。"
+        )
+        self.f10_notes.setPlainText(
+            "本页使用已加载的财务披露做纵向比较，不额外常驻报表缓存。\n"
+            + summary
+            + "\n提示：F10归纳用于研究，不能替代审计报告原文。"
+        )
 
     @classmethod
     def _fill_frame_table(
@@ -1344,7 +1567,9 @@ class DetailPage(QWidget):
         for index in range(len(columns)):
             header.setSectionResizeMode(index, QHeaderView.ResizeMode.ResizeToContents)
         if columns:
-            header.setSectionResizeMode(len(columns) - 1, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(
+                len(columns) - 1, QHeaderView.ResizeMode.Stretch
+            )
 
     @staticmethod
     def _display_value(value: object) -> str:
@@ -1363,7 +1588,9 @@ class DetailPage(QWidget):
         trading_day = self.intraday_date.date().toPython()
         period = str(self.intraday_period.currentData())
         self.intraday_button.setEnabled(False)
-        self.intraday_status.setText(f"正在加载 {trading_day:%Y-%m-%d} 的 {period} 分钟数据…")
+        self.intraday_status.setText(
+            f"正在加载 {trading_day:%Y-%m-%d} 的 {period} 分钟数据…"
+        )
         worker = Worker(self._fetch_intraday, security, trading_day, period, token)
         worker.signals.result.connect(self._on_intraday_loaded)
         worker.signals.error.connect(
@@ -1372,7 +1599,11 @@ class DetailPage(QWidget):
         self._start_worker(worker, lambda current=token: self._finish_intraday(current))
 
     def _fetch_intraday(
-        self, security: Security, trading_day, period: str, token: int  # type: ignore[no-untyped-def]
+        self,
+        security: Security,
+        trading_day,
+        period: str,
+        token: int,  # type: ignore[no-untyped-def]
     ) -> tuple[int, pd.DataFrame, str]:
         frame, source = self.provider.get_intraday(security, trading_day, period)
         return token, calculate_indicators(frame), source
@@ -1392,7 +1623,11 @@ class DetailPage(QWidget):
             reference_price=reference_price,
             percentage_axis=True,
         )
-        day = pd.Timestamp(frame.iloc[-1]["date"]).strftime("%Y-%m-%d") if not frame.empty else ""
+        day = (
+            pd.Timestamp(frame.iloc[-1]["date"]).strftime("%Y-%m-%d")
+            if not frame.empty
+            else ""
+        )
         realtime = " · 北京时间当日实时" if day == f"{beijing_today():%Y-%m-%d}" else ""
         base_text = f" · 零线 {reference_price:.2f}" if reference_price else ""
         self.intraday_status.setText(
@@ -1400,7 +1635,9 @@ class DetailPage(QWidget):
         )
 
     def _intraday_reference_price(
-        self, trading_day, frame: pd.DataFrame  # type: ignore[no-untyped-def]
+        self,
+        trading_day,
+        frame: pd.DataFrame,  # type: ignore[no-untyped-def]
     ) -> float | None:
         if trading_day is not None and self.bundle is not None:
             history = self.bundle.history.copy()
@@ -1458,7 +1695,12 @@ class DetailPage(QWidget):
         self.news_articles = articles
         self.news_table.setRowCount(len(articles))
         for row_index, article in enumerate(articles):
-            values = [article.published_at, article.source, article.title, article.summary]
+            values = [
+                article.published_at,
+                article.source,
+                article.title,
+                article.summary,
+            ]
             for column_index, text in enumerate(values):
                 item = QTableWidgetItem(text or "—")
                 item.setData(Qt.ItemDataRole.UserRole, article.url)
@@ -1500,12 +1742,18 @@ class DetailPage(QWidget):
         if self.formula_list.count():
             self.formula_list.setCurrentRow(selected_row)
 
-    def _load_formula_item(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None = None) -> None:
+    def _load_formula_item(
+        self, current: QListWidgetItem | None, _previous: QListWidgetItem | None = None
+    ) -> None:
         if current is None:
             return
         indicator_id = current.data(Qt.ItemDataRole.UserRole)
         indicator = next(
-            (item for item in self.repository.list_custom_indicators() if item.id == indicator_id),
+            (
+                item
+                for item in self.repository.list_custom_indicators()
+                if item.id == indicator_id
+            ),
             None,
         )
         if indicator is None:
@@ -1536,7 +1784,9 @@ class DetailPage(QWidget):
 
     def _validate_formula(self) -> None:
         try:
-            validation = self._formula_engine().validate(self.formula_edit.toPlainText())
+            validation = self._formula_engine().validate(
+                self.formula_edit.toPlainText()
+            )
         except FormulaError as exc:
             self.formula_status.setStyleSheet("color:#FF8297;")
             self.formula_status.setText(f"校验失败：{exc}")
@@ -1580,9 +1830,13 @@ class DetailPage(QWidget):
         self.custom_series = series
         self.custom_series_name = name
         latest = series.dropna()
-        latest_text = "数据不足" if latest.empty else f"最新值 {float(latest.iloc[-1]):.6g}"
+        latest_text = (
+            "数据不足" if latest.empty else f"最新值 {float(latest.iloc[-1]):.6g}"
+        )
         self.formula_status.setStyleSheet("color:#6EE7B7;")
-        self.formula_status.setText(f"计算完成：{latest_text}；有效点 {series.notna().sum()} / {len(series)}")
+        self.formula_status.setText(
+            f"计算完成：{latest_text}；有效点 {series.notna().sum()} / {len(series)}"
+        )
         self._update_charts()
 
     def _delete_formula(self) -> None:
