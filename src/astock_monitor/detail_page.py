@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
+from datetime import timedelta
 
 import pandas as pd
 from PySide6.QtCore import QDate, QThreadPool, Qt, QUrl, Signal
@@ -42,6 +44,7 @@ from .indicators import (
     calculate_indicators,
     candle_pattern_summary,
     dimension_composites,
+    detailed_indicator_description,
     market_regime,
     resample_ohlcv,
 )
@@ -81,15 +84,21 @@ class DetailPage(QWidget):
         self.bundle: DetailBundle | None = None
         self.indicator_frame = pd.DataFrame()
         self.snapshots: list[IndicatorSnapshot] = []
+        self.extended_snapshots: list[IndicatorSnapshot] = []
         self.custom_series: pd.Series | None = None
         self.custom_series_name = "自定义指标"
         self.chart_period = "daily"
         self._load_token = 0
         self._intraday_token = 0
         self._news_token = 0
+        self._extras_token = 0
+        self._extended_token = 0
         self._detail_running = False
         self._intraday_running = False
         self._news_running = False
+        self._extras_running = False
+        self._extended_running = False
+        self._extended_ready = False
         self._adjustment = "qfq"
         self._active_workers: set[Worker] = set()
         self.indicator_favorites: set[str] = set()
@@ -158,6 +167,7 @@ class DetailPage(QWidget):
         self.tabs.addTab(self.fundamentals_tab, "资金、筹码与公司")
         self.tabs.addTab(self.news_tab, "实时资讯")
         self.tabs.addTab(self.custom_tab, "自定义指标")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
 
     def _build_overview_tab(self) -> QWidget:
@@ -602,27 +612,95 @@ class DetailPage(QWidget):
         layout.addWidget(right, 1)
         return tab
 
+    def show_empty_state(self) -> None:
+        """Keep the full analysis workspace visible without fabricating a security."""
+
+        self.security = None
+        self.bundle = None
+        self.indicator_frame = pd.DataFrame()
+        self.snapshots = []
+        self.extended_snapshots = []
+        self.custom_series = None
+        self.news_articles = []
+        self._load_token += 1
+        self._intraday_token += 1
+        self._news_token += 1
+        self._extras_token += 1
+        self._extended_token += 1
+        self._detail_running = False
+        self._intraday_running = False
+        self._news_running = False
+        self._extras_running = False
+        self._extended_running = False
+        self._extended_ready = False
+        self.security_name.setText("尚未选择自选股票")
+        self.security_code.setText("请从“自选股票”页面双击一只证券进入")
+        self.price_label.setText("—")
+        self.change_label.setText("—")
+        self.latest_ohlc_label.setText("开 —  高 —  低 —  收 —")
+        self.loading_label.setText("分析框架已就绪；未载入任何非自选证券的数据。")
+        self.refresh_button.setEnabled(False)
+        self.watchlist_button.setEnabled(False)
+        self.adjustment_combo.setEnabled(False)
+        self.market_chart.clear()
+        self.intraday_chart.clear()
+        self.custom_chart.clear()
+        self.chip_detail_chart.clear()
+        self.signal_table.setRowCount(0)
+        self.indicator_table.setRowCount(0)
+        self.indicator_count.setText("0 项")
+        self.flow_table.setRowCount(0)
+        self.chip_table.setRowCount(0)
+        self.holder_table.setRowCount(0)
+        self.company_table.setRowCount(0)
+        self.business_table.setRowCount(0)
+        self.financial_table.setRowCount(0)
+        self.financial_chart.set_data(pd.DataFrame())
+        self.news_table.setRowCount(0)
+        self.intraday_status.setText("请先从自选股票页面进入一只证券。")
+        self.company_status.setText("尚未选择证券，不加载企业与财务数据。")
+        for card in (
+            self.regime_card,
+            self.score_card,
+            self.volatility_card,
+            self.drawdown_card,
+            self.main_flow_card,
+            self.profit_ratio_card,
+            self.average_cost_card,
+            self.concentration_card,
+        ):
+            card.set_value("—", "等待选择自选证券")
+        self.regime_summary.setText("从自选股票进入后，这里会显示加权六维评价与行情解读。")
+        self.tabs.setCurrentWidget(self.overview_tab)
+
     def load_security(self, security: Security) -> None:
         self.security = security
         self.bundle = None
         self.indicator_frame = pd.DataFrame()
         self.snapshots = []
+        self.extended_snapshots = []
         self.custom_series = None
         self._load_token += 1
         self._intraday_token += 1
         self._news_token += 1
+        self._extras_token += 1
+        self._extended_token += 1
         token = self._load_token
         self._detail_running = True
         self._intraday_running = False
         self._news_running = False
+        self._extras_running = False
+        self._extended_running = False
+        self._extended_ready = False
         self.indicator_favorites = self.repository.list_indicator_favorites()
+        self.watchlist_button.setEnabled(True)
         self.intraday_button.setEnabled(True)
         self.news_refresh_button.setEnabled(True)
         self.security_name.setText(security.name)
         self.security_code.setText(f"{security.display_code} · {security.security_type.label}")
         self.price_label.setText("—")
         self.change_label.setText("—")
-        self.loading_label.setText("正在加载历史行情、资金与筹码…")
+        self.loading_label.setText("正在优先加载行情；资金、公司和扩展指标按需加载…")
         self.refresh_button.setEnabled(False)
         self.adjustment_combo.setEnabled(security.security_type is not SecurityType.INDEX)
         today = beijing_today()
@@ -655,8 +733,10 @@ class DetailPage(QWidget):
     def _load_bundle_and_indicators(
         self, security: Security, adjustment: str, token: int
     ) -> tuple[int, DetailBundle, pd.DataFrame]:
-        bundle = self.provider.get_detail_bundle(security, adjustment=adjustment)
-        calculated = calculate_indicators(bundle.history, include_extended=True)
+        bundle = self.provider.get_detail_bundle(
+            security, adjustment=adjustment, include_extras=False
+        )
+        calculated = calculate_indicators(bundle.history, include_extended=False)
         return token, bundle, calculated
 
     def _on_bundle_loaded(self, result: object) -> None:
@@ -675,9 +755,173 @@ class DetailPage(QWidget):
         self._update_header()
         self._update_overview()
         self._populate_indicators()
+        self._reload_formula_list()
+        self._load_detail_extras(token)
+        if self.tabs.currentWidget() is self.indicators_tab:
+            self._ensure_extended_indicators()
+
+    def _load_detail_extras(self, token: int) -> None:
+        if self.security is None or self.bundle is None:
+            return
+        self._extras_running = True
+        self._extras_token = token
+        security = self.security
+        adjustment = self._adjustment
+        worker = Worker(
+            self.provider.get_detail_bundle,
+            security,
+            adjustment,
+            True,
+        )
+        worker.signals.result.connect(
+            lambda result, current=token: self._on_detail_extras(current, result)
+        )
+        worker.signals.error.connect(
+            lambda message, current=token: self._on_detail_extras_error(current, message)
+        )
+        self._start_worker(worker, lambda current=token: self._finish_detail_extras(current))
+
+    def _on_detail_extras(self, token: int, result: object) -> None:
+        if token != self._load_token or not isinstance(result, DetailBundle):
+            return
+        self.bundle = result
         self._populate_capital()
         self._populate_company()
-        self._reload_formula_list()
+
+    def _on_detail_extras_error(self, token: int, message: str) -> None:
+        if token != self._load_token:
+            return
+        self.company_status.setText(f"资金与公司资料加载失败：{message}")
+
+    def _finish_detail_extras(self, token: int) -> None:
+        if token == self._load_token:
+            self._extras_running = False
+
+    def _on_tab_changed(self, _index: int) -> None:
+        if self.tabs.currentWidget() is self.indicators_tab:
+            self._ensure_extended_indicators()
+
+    def _ensure_extended_indicators(self) -> None:
+        if (
+            self.security is None
+            or self.bundle is None
+            or self._extended_ready
+            or self._extended_running
+        ):
+            return
+        self._extended_token += 1
+        token = self._extended_token
+        security = self.security
+        history = self.bundle.history.copy()
+        adjustment = self._adjustment
+        self._extended_running = True
+        self.indicator_count.setText("正在载入扩展指标；首次计算后会使用轻量缓存…")
+        worker = Worker(
+            self._load_extended_indicator_snapshots,
+            token,
+            security,
+            history,
+            adjustment,
+        )
+        worker.signals.result.connect(self._on_extended_indicators_loaded)
+        worker.signals.error.connect(
+            lambda message, current=token: self._on_extended_indicators_error(current, message)
+        )
+        self._start_worker(worker, lambda current=token: self._finish_extended_indicators(current))
+
+    def _load_extended_indicator_snapshots(
+        self,
+        token: int,
+        security: Security,
+        history: pd.DataFrame,
+        adjustment: str,
+    ) -> tuple[int, list[IndicatorSnapshot]]:
+        last = history.iloc[-1]
+        signature = {
+            "version": 4,
+            "rows": len(history),
+            "date": str(pd.Timestamp(last["date"])),
+            "close": float(last["close"]),
+            "volume": float(last["volume"]),
+            "adjustment": adjustment,
+        }
+        cache_path = self.provider.cache_dir / (
+            f"indicator_snapshots_v4_{security.security_type.value}_{security.code}_{adjustment or 'raw'}.json"
+        )
+        if cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                cached_signature = cached.get("signature", {})
+                same_series = all(
+                    cached_signature.get(key) == signature.get(key)
+                    for key in ("version", "rows", "date", "adjustment")
+                )
+                exact_tick = cached_signature == signature
+                recent_tick = self.provider._cache_is_fresh(
+                    cache_path, timedelta(minutes=10)
+                )
+                if same_series and (exact_tick or recent_tick):
+                    snapshots = [
+                        IndicatorSnapshot(
+                            IndicatorDefinition(**item["definition"]),
+                            item.get("value"),
+                            str(item.get("status", "—")),
+                        )
+                        for item in cached.get("snapshots", [])
+                    ]
+                    if snapshots:
+                        return token, snapshots
+            except (OSError, TypeError, ValueError, KeyError):
+                pass
+        calculated = calculate_indicators(history, include_extended=True)
+        snapshots = [
+            item
+            for item in build_indicator_snapshot(calculated)
+            if item.definition.column.startswith("PTA_")
+        ]
+        payload = {
+            "signature": signature,
+            "snapshots": [
+                {
+                    "definition": {
+                        "category": item.definition.category,
+                        "name": item.definition.name,
+                        "column": item.definition.column,
+                        "description": item.definition.description,
+                        "unit": item.definition.unit,
+                        "origin": item.definition.origin,
+                        "key": item.definition.key,
+                    },
+                    "value": item.value,
+                    "status": item.status,
+                }
+                for item in snapshots
+            ],
+        }
+        cache_path.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        return token, snapshots
+
+    def _on_extended_indicators_loaded(self, result: object) -> None:
+        if not isinstance(result, tuple) or len(result) != 2:
+            return
+        token, snapshots = result
+        if token != self._extended_token or not isinstance(snapshots, list):
+            return
+        self.extended_snapshots = snapshots
+        self._extended_ready = True
+        self._rebuild_indicator_library()
+        self._populate_indicators()
+        self._update_overview()
+
+    def _on_extended_indicators_error(self, token: int, message: str) -> None:
+        if token == self._extended_token:
+            self.indicator_count.setText(f"扩展指标加载失败：{message}")
+
+    def _finish_extended_indicators(self, token: int) -> None:
+        if token == self._extended_token:
+            self._extended_running = False
 
     def _on_load_error(self, token: int, message: str) -> None:
         if token != self._load_token:
@@ -799,7 +1043,11 @@ class DetailPage(QWidget):
             composite = composites[category]
             self.signal_table.setItem(row, 0, QTableWidgetItem(category))
             self.signal_table.setItem(
-                row, 1, QTableWidgetItem(f"综合 {int(composite['count'])} 项")
+                row,
+                1,
+                QTableWidgetItem(
+                    f"综合 {int(composite['count'])} 项 · 权重 {float(composite['weight']):.1f}"
+                ),
             )
             pill = StatusPill(
                 f"{composite['status']} · {float(composite['score']):.0f}"
@@ -820,7 +1068,7 @@ class DetailPage(QWidget):
             value_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.indicator_table.setItem(row, 3, value_item)
             self.indicator_table.setCellWidget(row, 4, StatusPill(snapshot.status))
-            description = QTableWidgetItem(definition.description)
+            description = QTableWidgetItem(detailed_indicator_description(definition))
             description.setForeground(QColor("#A8B6C9"))
             self.indicator_table.setItem(row, 5, description)
             identifier = definition.identifier
@@ -869,7 +1117,10 @@ class DetailPage(QWidget):
                 )
             )
         self.indicator_frame.attrs["custom_indicator_definitions"] = definitions
-        self.snapshots = build_indicator_snapshot(self.indicator_frame)
+        self.snapshots = [
+            *build_indicator_snapshot(self.indicator_frame),
+            *self.extended_snapshots,
+        ]
 
     def _filter_indicators(self, *_args) -> None:  # type: ignore[no-untyped-def]
         query = self.indicator_search.text().strip().lower()
@@ -1132,10 +1383,38 @@ class DetailPage(QWidget):
         token, frame, source = result
         if token != self._intraday_token or not isinstance(frame, pd.DataFrame):
             return
-        self.intraday_chart.set_data(frame)
+        trading_day = (
+            pd.Timestamp(frame.iloc[-1]["date"]).date() if not frame.empty else None
+        )
+        reference_price = self._intraday_reference_price(trading_day, frame)
+        self.intraday_chart.set_data(
+            frame,
+            reference_price=reference_price,
+            percentage_axis=True,
+        )
         day = pd.Timestamp(frame.iloc[-1]["date"]).strftime("%Y-%m-%d") if not frame.empty else ""
         realtime = " · 北京时间当日实时" if day == f"{beijing_today():%Y-%m-%d}" else ""
-        self.intraday_status.setText(f"已加载 {len(frame)} 个分时点 · {source}{realtime}")
+        base_text = f" · 零线 {reference_price:.2f}" if reference_price else ""
+        self.intraday_status.setText(
+            f"已加载 {len(frame)} 个分时点 · {source}{realtime}{base_text}"
+        )
+
+    def _intraday_reference_price(
+        self, trading_day, frame: pd.DataFrame  # type: ignore[no-untyped-def]
+    ) -> float | None:
+        if trading_day is not None and self.bundle is not None:
+            history = self.bundle.history.copy()
+            dates = pd.to_datetime(history.get("date"), errors="coerce")
+            previous = history[dates.dt.date < trading_day]
+            if not previous.empty:
+                value = self._number(previous.iloc[-1].get("close"))
+                if value and value > 0:
+                    return value
+        if frame is not None and not frame.empty:
+            value = self._number(frame.iloc[0].get("open"))
+            if value and value > 0:
+                return value
+        return None
 
     def _on_intraday_error(self, token: int, message: str) -> None:
         if token != self._intraday_token:

@@ -10,16 +10,19 @@ from PySide6.QtCore import QThreadPool, Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from astock_monitor.chart_widget import MarketChart  # noqa: E402
-from astock_monitor.data_provider import DataProvider  # noqa: E402
+from astock_monitor.data_provider import DataProvider, DetailBundle  # noqa: E402
 from astock_monitor.detail_page import DetailPage  # noqa: E402
 from astock_monitor.indicators import (  # noqa: E402
     IndicatorDefinition,
     IndicatorSnapshot,
     build_indicator_snapshot,
     calculate_indicators,
+    detailed_indicator_description,
     dimension_composites,
+    indicator_weight,
     resample_ohlcv,
 )
+from astock_monitor.main_window import MainWindow  # noqa: E402
 from astock_monitor.models import (  # noqa: E402
     CustomIndicator,
     Quote,
@@ -198,4 +201,103 @@ def test_watchlist_numeric_sort_keeps_security_mapping_and_score(tmp_path) -> No
     assert page.table.horizontalHeaderItem(13).text() == "评分"
     assert page.table.item(0, 4).text() == "8.00"
     assert page._security_at_row(0).key == second.key
+    app.processEvents()
+
+
+def test_intraday_chart_keeps_zero_line_reference_and_percentage_axis() -> None:
+    app = QApplication.instance() or QApplication([])
+    frame = sample_history(30)
+    frame["date"] = pd.date_range("2026-07-15 09:31", periods=len(frame), freq="min")
+    chart = MarketChart()
+    chart.set_data(frame, reference_price=10.0, percentage_axis=True)
+
+    assert chart._reference_price == 10.0
+    assert chart._percentage_axis is True
+    chart.resize(900, 600)
+    chart.show()
+    app.processEvents()
+    chart.close()
+
+
+def test_classic_indicators_have_more_score_weight_and_detailed_text() -> None:
+    classic = IndicatorDefinition("趋势", "MACD 柱", "MACD_HIST", "趋势动量柱")
+    extended = IndicatorDefinition("趋势", "扩展输出", "PTA_SAMPLE", "扩展指标")
+    snapshots = [
+        IndicatorSnapshot(classic, 1.0, "偏多"),
+        IndicatorSnapshot(extended, -1.0, "偏空"),
+    ]
+
+    result = dimension_composites(snapshots)["趋势"]
+    assert indicator_weight(classic) > indicator_weight(extended)
+    assert float(result["score"]) > 75
+    description = detailed_indicator_description(classic)
+    assert "计算与解读" in description
+    assert "评分预设权重" in description
+    assert len(description) > 80
+
+
+def test_detail_first_paint_does_not_expand_hundreds_of_indicators(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = DataProvider(tmp_path / "cache")
+    repository = Repository(tmp_path / "monitor.db")
+    page = DetailPage(repository, provider, QThreadPool())
+    security = Security("600000", "浦发银行", SecurityType.STOCK, "sh")
+    history = sample_history(180)
+    monkeypatch.setattr(
+        provider,
+        "get_detail_bundle",
+        lambda *_args, **_kwargs: DetailBundle(security=security, history=history),
+    )
+
+    _, _, frame = page._load_bundle_and_indicators(security, "qfq", 1)
+
+    assert not any(str(column).startswith("PTA_") for column in frame.columns)
+    assert len(frame.columns) < 150
+
+
+def test_market_dashboard_calculates_breadth_and_leading_sector(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = DataProvider(tmp_path / "cache")
+    spot = pd.DataFrame(
+        {
+            "代码": ["600000", "000001", "300750"],
+            "名称": ["A", "B", "C"],
+            "最新价": [10.0, 11.0, 12.0],
+            "涨跌幅": [10.0, -10.0, 1.5],
+            "成交额": [100.0, 200.0, 300.0],
+        }
+    )
+    sectors = pd.DataFrame(
+        {
+            "板块名称": ["银行", "电池"],
+            "涨跌幅": [1.0, 3.0],
+            "领涨股票": ["A", "C"],
+            "领涨股票-涨跌幅": [2.0, 6.0],
+        }
+    )
+    monkeypatch.setattr(provider, "refresh_quotes", lambda _items: {})
+
+    def fake_cache(name, _code, _loader, _age):  # type: ignore[no-untyped-def]
+        return spot.copy() if name == "market_breadth" else sectors.copy()
+
+    monkeypatch.setattr(provider, "_load_extra_with_cache", fake_cache)
+    result = provider.get_market_dashboard()
+
+    assert result.breadth["up"] == 2
+    assert result.breadth["down"] == 1
+    assert result.breadth["limit_up"] == 1
+    assert result.sectors.iloc[0]["行业"] == "电池"
+
+
+def test_main_navigation_keeps_empty_detail_until_watchlist_selection(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(
+        Repository(tmp_path / "monitor.db"), DataProvider(tmp_path / "cache")
+    )
+    window.show_page("detail")
+
+    assert window.stack.currentWidget() is window.detail_page
+    assert window.detail_page.security is None
+    assert window.navigation_buttons["detail"].isChecked()
+    window.show_page("strategy")
+    assert window.stack.currentWidget() is window.strategy_page
+    window.close()
     app.processEvents()

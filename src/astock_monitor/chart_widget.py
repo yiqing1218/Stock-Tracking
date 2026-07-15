@@ -36,6 +36,8 @@ class MarketChart(QWidget):
         self._frame = pd.DataFrame()
         self._custom: pd.Series | None = None
         self._custom_name = "MACD"
+        self._reference_price: float | None = None
+        self._percentage_axis = False
         self._visible_count = 120
         self._right_offset = 0
         self._hover_position: QPointF | None = None
@@ -50,10 +52,20 @@ class MarketChart(QWidget):
         frame: pd.DataFrame,
         custom: pd.Series | None = None,
         custom_name: str = "MACD",
+        reference_price: float | None = None,
+        percentage_axis: bool = False,
     ) -> None:
         self._frame = frame.copy()
         self._custom = custom.reindex(frame.index) if custom is not None else None
         self._custom_name = custom_name
+        self._reference_price = (
+            float(reference_price)
+            if reference_price is not None
+            and np.isfinite(float(reference_price))
+            and float(reference_price) > 0
+            else None
+        )
+        self._percentage_axis = bool(percentage_axis and self._reference_price)
         self._visible_count = min(max(40, self._visible_count), max(40, len(frame)))
         self._right_offset = 0
         self.update()
@@ -61,6 +73,8 @@ class MarketChart(QWidget):
     def clear(self) -> None:
         self._frame = pd.DataFrame()
         self._custom = None
+        self._reference_price = None
+        self._percentage_axis = False
         self._visible_frame = pd.DataFrame()
         self._right_offset = 0
         self.update()
@@ -184,7 +198,7 @@ class MarketChart(QWidget):
         header_height = 34.0
         content_top = bounds.top() + header_height
         content_height = bounds.height() - header_height - 24
-        right_axis = 62.0
+        right_axis = 118.0 if self._percentage_axis else 62.0
         price_rect = QRectF(bounds.left() + 8, content_top, bounds.width() - right_axis - 12, content_height * 0.62)
         volume_rect = QRectF(price_rect.left(), price_rect.bottom() + 8, price_rect.width(), content_height * 0.16)
         indicator_rect = QRectF(price_rect.left(), volume_rect.bottom() + 8, price_rect.width(), content_height * 0.20 - 12)
@@ -216,6 +230,9 @@ class MarketChart(QWidget):
             x += painter.fontMetrics().horizontalAdvance(text) + 20
         last = frame.iloc[-1]
         summary = f"开 {last['open']:.2f}  高 {last['high']:.2f}  低 {last['low']:.2f}  收 {last['close']:.2f}"
+        if self._percentage_axis and self._reference_price:
+            change_pct = (float(last["close"]) / self._reference_price - 1) * 100
+            summary += f"  涨跌 {change_pct:+.2f}%"
         painter.setPen(COLORS["muted"])
         width = painter.fontMetrics().horizontalAdvance(summary)
         painter.drawText(QPointF(bounds.right() - width - 12, bounds.top() + 22), summary)
@@ -238,10 +255,21 @@ class MarketChart(QWidget):
         for column in overlay_columns:
             values.extend([frame[column].min(skipna=True), frame[column].max(skipna=True)])
         finite = [float(value) for value in values if pd.notna(value) and math.isfinite(float(value))]
-        low_value, high_value = min(finite), max(finite)
-        padding = max((high_value - low_value) * 0.06, high_value * 0.002)
-        low_value -= padding
-        high_value += padding
+        reference = self._reference_price if self._percentage_axis else None
+        if reference is not None:
+            maximum_deviation = max(
+                [abs(value - reference) for value in finite] + [reference * 0.001]
+            )
+            maximum_deviation *= 1.08
+            low_value, high_value = (
+                reference - maximum_deviation,
+                reference + maximum_deviation,
+            )
+        else:
+            low_value, high_value = min(finite), max(finite)
+            padding = max((high_value - low_value) * 0.06, high_value * 0.002)
+            low_value -= padding
+            high_value += padding
 
         def map_y(value: float) -> float:
             return rect.bottom() - (value - low_value) / max(high_value - low_value, EPS) * rect.height()
@@ -251,6 +279,10 @@ class MarketChart(QWidget):
         body_width = max(1.5, min(10.0, spacing * 0.62))
         painter.save()
         painter.setClipRect(rect)
+        if reference is not None:
+            zero_y = map_y(reference)
+            painter.setPen(QPen(QColor("#6B7F99"), 1, Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(rect.left(), zero_y), QPointF(rect.right(), zero_y))
         for index, row in frame.iterrows():
             x = rect.left() + (index + 0.5) * spacing
             up = row["close"] >= row["open"]
@@ -275,7 +307,13 @@ class MarketChart(QWidget):
             if column in frame:
                 self._draw_series(painter, rect, frame[column], map_y, color, width)
         painter.restore()
-        self._draw_axis_labels(painter, rect, low_value, high_value)
+        self._draw_axis_labels(
+            painter,
+            rect,
+            low_value,
+            high_value,
+            reference_price=reference,
+        )
 
     def _draw_volume_panel(self, painter: QPainter, rect: QRectF, frame: pd.DataFrame) -> None:
         maximum = float(frame["volume"].max()) if frame["volume"].notna().any() else 1.0
@@ -388,6 +426,7 @@ class MarketChart(QWidget):
         low_value: float,
         high_value: float,
         precision: int = 2,
+        reference_price: float | None = None,
     ) -> None:
         painter.setFont(QFont("Microsoft YaHei UI", 8))
         painter.setPen(COLORS["muted"])
@@ -395,7 +434,11 @@ class MarketChart(QWidget):
             ratio = step / 4
             value = high_value - (high_value - low_value) * ratio
             y = rect.top() + rect.height() * ratio + 4
-            painter.drawText(QPointF(rect.right() + 6, y), f"{value:.{precision}f}")
+            label = f"{value:.{precision}f}"
+            if reference_price is not None and reference_price > 0:
+                percent = (value / reference_price - 1) * 100
+                label += f"  {percent:+.2f}%"
+            painter.drawText(QPointF(rect.right() + 6, y), label)
 
     def _draw_dates(self, painter: QPainter, bounds: QRectF, rect: QRectF, frame: pd.DataFrame) -> None:
         painter.setFont(QFont("Microsoft YaHei UI", 8))
@@ -431,6 +474,9 @@ class MarketChart(QWidget):
             f"{date_text}   开 {row['open']:.2f}  高 {row['high']:.2f}  "
             f"低 {row['low']:.2f}  收 {row['close']:.2f}  量 {self._compact_number(row['volume'])}"
         )
+        if self._percentage_axis and self._reference_price:
+            percent = (float(row["close"]) / self._reference_price - 1) * 100
+            text += f"  涨跌 {percent:+.2f}%"
         metrics = painter.fontMetrics()
         tooltip = QRectF(rect.left() + 8, rect.top() + 8, metrics.horizontalAdvance(text) + 20, 28)
         painter.fillRect(tooltip, QColor("#13233A"))

@@ -54,6 +54,17 @@ COMMON_ETFS = [
     Security("588000", "科创50ETF", SecurityType.ETF, "sh"),
 ]
 
+MARKET_DASHBOARD_INDICES = [
+    Security("000001", "上证指数", SecurityType.INDEX, "sh"),
+    Security("399001", "深证成指", SecurityType.INDEX, "sz"),
+    Security("399006", "创业板指", SecurityType.INDEX, "sz"),
+    Security("000300", "沪深300", SecurityType.INDEX, "csi"),
+    Security("000016", "上证50", SecurityType.INDEX, "sh"),
+    Security("000905", "中证500", SecurityType.INDEX, "csi"),
+    Security("000688", "科创50", SecurityType.INDEX, "sh"),
+    Security("899050", "北证50", SecurityType.INDEX, "bj"),
+]
+
 INDEX_GROUPS = ("沪深重要指数", "上证系列指数", "深证系列指数", "中证系列指数")
 
 
@@ -103,6 +114,17 @@ class DetailBundle:
     company_info: pd.DataFrame = field(default_factory=pd.DataFrame)
     business_info: pd.DataFrame = field(default_factory=pd.DataFrame)
     financials: pd.DataFrame = field(default_factory=pd.DataFrame)
+    sources: dict[str, str] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class MarketDashboardBundle:
+    quotes: dict[str, Quote] = field(default_factory=dict)
+    breadth: dict[str, float | int] = field(default_factory=dict)
+    gainers: pd.DataFrame = field(default_factory=pd.DataFrame)
+    losers: pd.DataFrame = field(default_factory=pd.DataFrame)
+    sectors: pd.DataFrame = field(default_factory=pd.DataFrame)
     sources: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -225,6 +247,223 @@ class DataProvider:
                 quotes[security.key] = Quote(security=security)
         return quotes
 
+    def get_market_dashboard(self) -> MarketDashboardBundle:
+        """Load index snapshots, A-share breadth and leading industries."""
+
+        bundle = MarketDashboardBundle()
+        bundle.quotes = self.refresh_quotes(MARKET_DASHBOARD_INDICES)
+        bundle.sources["indices"] = "东方财富/腾讯/新浪实时行情自动回退"
+
+        jobs = {
+            "breadth": (
+                "market_breadth",
+                self._load_market_spot,
+                timedelta(seconds=45),
+            ),
+            "sectors": (
+                "market_sectors",
+                self._load_industry_boards,
+                timedelta(minutes=3),
+            ),
+        }
+        frames: dict[str, pd.DataFrame] = {}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                executor.submit(
+                    self._load_extra_with_cache,
+                    cache_name,
+                    "all",
+                    loader,
+                    max_age,
+                ): name
+                for name, (cache_name, loader, max_age) in jobs.items()
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    frames[name] = future.result()
+                except Exception as exc:
+                    bundle.warnings.append(f"{name}: {exc}")
+
+        spot = frames.get("breadth", pd.DataFrame())
+        if not spot.empty:
+            change_column = next(
+                (column for column in ("涨跌幅", "涨跌幅%") if column in spot),
+                None,
+            )
+            amount_column = next(
+                (column for column in ("成交额", "成交金额") if column in spot),
+                None,
+            )
+            code_column = next(
+                (column for column in ("代码", "股票代码") if column in spot),
+                None,
+            )
+            name_column = next(
+                (column for column in ("名称", "股票简称") if column in spot),
+                None,
+            )
+            price_column = next(
+                (column for column in ("最新价", "最新") if column in spot),
+                None,
+            )
+            if change_column:
+                changes = pd.to_numeric(spot[change_column], errors="coerce")
+                valid = changes.dropna()
+                amounts = (
+                    pd.to_numeric(spot[amount_column], errors="coerce")
+                    if amount_column
+                    else pd.Series(dtype=float)
+                )
+                bundle.breadth = {
+                    "up": int((valid > 0).sum()),
+                    "down": int((valid < 0).sum()),
+                    "flat": int((valid == 0).sum()),
+                    "limit_up": int((valid >= 9.5).sum()),
+                    "limit_down": int((valid <= -9.5).sum()),
+                    "median_change": float(valid.median()) if not valid.empty else 0.0,
+                    "amount": float(amounts.sum()) if not amounts.empty else 0.0,
+                }
+                if code_column and name_column and price_column:
+                    movers = pd.DataFrame(
+                        {
+                            "代码": spot[code_column].astype(str).str.extract(r"(\d+)", expand=False).str.zfill(6),
+                            "名称": spot[name_column].astype(str),
+                            "最新价": pd.to_numeric(spot[price_column], errors="coerce"),
+                            "涨跌幅": changes,
+                            "成交额": amounts.reindex(spot.index),
+                        }
+                    ).dropna(subset=["涨跌幅"])
+                    bundle.gainers = movers.nlargest(8, "涨跌幅").reset_index(drop=True)
+                    bundle.losers = movers.nsmallest(8, "涨跌幅").reset_index(drop=True)
+            bundle.sources["breadth"] = str(
+                spot.attrs.get("source", "AkShare·东方财富A股快照/本地缓存")
+            )
+
+        sectors = frames.get("sectors", pd.DataFrame())
+        if not sectors.empty:
+            name_column = next(
+                (column for column in ("板块名称", "名称") if column in sectors),
+                None,
+            )
+            change_column = next(
+                (column for column in ("涨跌幅", "涨跌幅%") if column in sectors),
+                None,
+            )
+            leader_column = next(
+                (column for column in ("领涨股票", "领涨股") if column in sectors),
+                None,
+            )
+            leader_change_column = next(
+                (column for column in ("领涨股票-涨跌幅", "领涨股涨跌幅") if column in sectors),
+                None,
+            )
+            if name_column and change_column:
+                output = pd.DataFrame(
+                    {
+                        "行业": sectors[name_column].astype(str),
+                        "涨跌幅": pd.to_numeric(sectors[change_column], errors="coerce"),
+                        "领涨股": sectors[leader_column].astype(str) if leader_column else "—",
+                        "领涨股涨跌幅": (
+                            pd.to_numeric(sectors[leader_change_column], errors="coerce")
+                            if leader_change_column
+                            else np.nan
+                        ),
+                    }
+                ).dropna(subset=["涨跌幅"])
+                bundle.sectors = output.nlargest(10, "涨跌幅").reset_index(drop=True)
+            bundle.sources["sectors"] = str(
+                sectors.attrs.get("source", "AkShare·东方财富行业板块/本地缓存")
+            )
+        return bundle
+
+    @staticmethod
+    def _eastmoney_clist(
+        url: str, *, fs: str, fields: str, page_size: int
+    ) -> pd.DataFrame:
+        response = requests.get(
+            url,
+            params={
+                "pn": "1",
+                "pz": str(page_size),
+                "po": "1",
+                "np": "1",
+                "fltt": "2",
+                "invt": "2",
+                "fid": "f3",
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "fs": fs,
+                "fields": fields,
+            },
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        data = response.json().get("data") or {}
+        values = data.get("diff")
+        if not isinstance(values, list) or not values:
+            raise RuntimeError("东方财富列表接口未返回数据")
+        return pd.DataFrame(values)
+
+    def _load_market_spot(self) -> pd.DataFrame:
+        errors: list[str] = []
+        try:
+            raw = self._eastmoney_clist(
+                "https://push2.eastmoney.com/api/qt/clist/get",
+                fs="m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:7+f:!2",
+                fields="f12,f14,f2,f3,f6",
+                page_size=6000,
+            )
+            frame = raw.rename(
+                columns={"f12": "代码", "f14": "名称", "f2": "最新价", "f3": "涨跌幅", "f6": "成交额"}
+            )[["代码", "名称", "最新价", "涨跌幅", "成交额"]]
+            frame.attrs["source"] = "东方财富全A快照直连"
+            return frame
+        except Exception as exc:
+            errors.append(f"东方财富直连: {exc}")
+        try:
+            frame = ak.stock_zh_a_spot_em()
+            frame = frame.copy()
+            frame.attrs["source"] = "AkShare·东方财富A股实时快照"
+            return frame
+        except Exception as exc:
+            errors.append(f"AkShare: {exc}")
+        raise RuntimeError("；".join(errors))
+
+    def _load_industry_boards(self) -> pd.DataFrame:
+        errors: list[str] = []
+        try:
+            raw = self._eastmoney_clist(
+                "https://17.push2.eastmoney.com/api/qt/clist/get",
+                fs="m:90 t:2 f:!50",
+                fields="f12,f14,f2,f3,f104,f105,f128,f136",
+                page_size=200,
+            )
+            frame = raw.rename(
+                columns={
+                    "f12": "板块代码",
+                    "f14": "板块名称",
+                    "f2": "最新价",
+                    "f3": "涨跌幅",
+                    "f104": "上涨家数",
+                    "f105": "下跌家数",
+                    "f128": "领涨股票",
+                    "f136": "领涨股票-涨跌幅",
+                }
+            )
+            frame.attrs["source"] = "东方财富行业板块直连"
+            return frame
+        except Exception as exc:
+            errors.append(f"东方财富直连: {exc}")
+        try:
+            frame = ak.stock_board_industry_name_em()
+            frame = frame.copy()
+            frame.attrs["source"] = "AkShare·东方财富行业板块"
+            return frame
+        except Exception as exc:
+            errors.append(f"AkShare: {exc}")
+        raise RuntimeError("；".join(errors))
+
     def refresh_scores(self, securities: list[Security]) -> dict[str, float]:
         """Calculate the same six-dimension score used by the detail page."""
 
@@ -232,7 +471,7 @@ class DataProvider:
 
         def calculate(security: Security) -> tuple[str, float]:
             path = self.cache_dir / (
-                f"score_v2_{security.security_type.value}_{security.code}.json"
+                f"score_v3_{security.security_type.value}_{security.code}.json"
             )
             if self._cache_is_fresh(path, timedelta(minutes=10)):
                 try:
@@ -243,7 +482,10 @@ class DataProvider:
             history = self.get_history(
                 security, use_cache=True, adjustment="qfq", include_live=True
             )
-            frame = calculate_indicators(history, include_extended=True)
+            # 首页评分与详情页首屏采用同一组经典系统指标；扩展指标库
+            # 在用户打开“全部指标”时按需计算，避免监看页为每只股票
+            # 同时展开数百列而占用大量内存。
+            frame = calculate_indicators(history, include_extended=False)
             score = float(market_regime(frame)["score"])
             path.write_text(
                 json.dumps(
@@ -267,7 +509,7 @@ class DataProvider:
                     scores[key] = score
                 except Exception:
                     path = self.cache_dir / (
-                        f"score_v2_{security.security_type.value}_{security.code}.json"
+                        f"score_v3_{security.security_type.value}_{security.code}.json"
                     )
                     if path.exists():
                         try:
@@ -703,10 +945,17 @@ class DataProvider:
                 ) if include_live else cached
         raise RuntimeError("所有日线接口均不可用：" + "；".join(errors))
 
-    def get_detail_bundle(self, security: Security, adjustment: str = "qfq") -> DetailBundle:
+    def get_detail_bundle(
+        self,
+        security: Security,
+        adjustment: str = "qfq",
+        include_extras: bool = True,
+    ) -> DetailBundle:
         history = self.get_history(security, adjustment=adjustment, include_live=True)
         bundle = DetailBundle(security=security, history=history)
         bundle.sources["日线"] = self.history_sources.get(security.key, "未知")
+        if not include_extras:
+            return bundle
         if security.security_type is not SecurityType.STOCK:
             bundle.warnings.append("ETF/指数不提供个股股东与筹码披露数据。")
             return bundle

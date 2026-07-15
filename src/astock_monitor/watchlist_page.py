@@ -304,6 +304,9 @@ class WatchlistPage(QWidget):
             self._load_universe_async()
         self.refresh_timer.start()
 
+    def stop(self) -> None:
+        self.refresh_timer.stop()
+
     def _load_universe_async(self) -> None:
         if self._universe_loading:
             return

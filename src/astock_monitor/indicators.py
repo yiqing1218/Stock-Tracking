@@ -265,11 +265,17 @@ def _calculate_extended_indicators(
     if "date" in pta_frame:
         pta_frame.index = pd.to_datetime(pta_frame["date"], errors="coerce")
     pta_frame = pta_frame[base_columns]
-    pta_frame.ta.cores = 0
+    # Pandas TA Classic's accessor is not cached; configure and reuse the same
+    # instance or a second ``df.ta`` access silently restores cpu_count().
+    # A single-process run is essential inside a Qt worker on Windows: spawning
+    # one process per CPU causes very high memory use and can recursively import
+    # the desktop entry point.
+    accessor = pta_frame.ta
+    accessor.cores = 0
     original_count = len(pta_frame.columns)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        pta_frame.ta.strategy()
+        accessor.strategy()
     generated = pta_frame.iloc[:, original_count:]
     series_map: dict[str, pd.Series] = {}
     definitions: list[IndicatorDefinition] = []
@@ -516,6 +522,94 @@ class IndicatorDefinition:
         return self.key or f"system:{self.column}"
 
 
+_CLASSIC_WEIGHT_PREFIXES = (
+    "SMA_20",
+    "SMA_60",
+    "MACD_",
+    "ADX_",
+    "PLUS_DI_",
+    "MINUS_DI_",
+    "RSI_14",
+    "KDJ_",
+    "BB_",
+    "ATR_",
+    "OBV",
+    "MFI_",
+    "CMF_",
+    "VWAP",
+    "DRAWDOWN",
+)
+
+
+def indicator_weight(definition: IndicatorDefinition) -> float:
+    """Preset scoring weight; classic, interpretable indicators lead the score."""
+
+    if definition.origin == "自定义":
+        return 1.0
+    if definition.column.startswith("PTA_"):
+        return 0.35
+    if definition.column.startswith(_CLASSIC_WEIGHT_PREFIXES):
+        return 2.5
+    if definition.column.startswith(("RETURN_", "HV_", "NATR_", "PSY_", "BIAS_")):
+        return 1.8
+    return 1.25
+
+
+_DIMENSION_EXPLANATIONS = {
+    "趋势": "用于判断方向、排列和趋势持续性；连续信号比单日信号更可靠，震荡市中容易反复失真。",
+    "动量": "衡量价格推进速度与超买超卖位置；极值表示强弱程度，不等同于立即反转。",
+    "波动": "描述价格振幅、通道宽度和风险扩张；高低本身不代表涨跌方向，应结合趋势使用。",
+    "量能": "把成交量、成交额或资金压力与价格结合；放量要同时观察价格方向和所处位置。",
+    "情绪": "刻画短期买卖意愿、K线行为和市场温度；对消息与跳空较敏感，宜用多日确认。",
+    "风险": "衡量收益分布、回撤和尾部风险；统计结果依赖样本窗口，不代表未来损失上限。",
+}
+
+_INDICATOR_EXPLANATIONS = {
+    "MACD": "由快慢指数均线及其信号线构成，重点看零轴位置、交叉方向和柱体扩张或收缩。",
+    "RSI": "比较一定窗口内平均上涨幅度与平均下跌幅度，常用 30/70 或 20/80 观察强弱区间。",
+    "ADX": "由方向运动系统推导趋势强度，数值升高代表趋势增强，但不直接说明上涨或下跌。",
+    "KDJ": "以近期高低区间定位收盘价，并对随机值平滑；J 值更敏感，也更容易出现极端值。",
+    "STOCH": "比较收盘价在近期最高价与最低价区间中的位置，适合观察短周期动量转折。",
+    "WILLR": "以负值表示收盘价距近期高点的位置，接近 0 偏强，接近 -100 偏弱。",
+    "BB_": "以移动均线为中轨、标准差为带宽构造通道，可同时观察趋势位置与波动收缩扩张。",
+    "BOLL": "以移动均线为中轨、标准差为带宽构造通道，可同时观察趋势位置与波动收缩扩张。",
+    "ATR": "综合当日振幅和跳空缺口估计真实波幅，常用于仓位、止损距离和波动比较。",
+    "OBV": "按涨跌方向累计成交量，观察量能趋势是否与价格趋势确认或背离。",
+    "MFI": "把典型价格与成交量合成资金流强弱，逻辑类似带成交量权重的 RSI。",
+    "CMF": "根据收盘价在日内高低区间的位置对成交量加权，正值偏向净流入压力。",
+    "VWAP": "以成交额除以成交量得到成交均价参考，可用于比较现价与市场平均成交成本。",
+    "PSAR": "用随趋势加速的抛物线点位跟踪方向，反转时点位会从价格一侧切换到另一侧。",
+    "SUPERTREND": "以 ATR 波动带跟踪趋势，价格穿越跟踪线时切换方向，参数越小越灵敏。",
+    "ICHIMOKU": "用多组周期中点构成转换线、基准线和云层，综合判断趋势、支撑阻力与位置。",
+    "AROON": "比较近期最高点和最低点距当前的时间，判断新高或新低出现的活跃程度。",
+    "CCI": "衡量典型价格偏离其移动平均的程度，绝对值扩大表示价格偏离增强。",
+    "ROC": "计算当前价格相对若干周期前的百分比变化，零轴上方代表正向动量。",
+    "DRAWDOWN": "计算当前价格相对历史高点的跌幅，用于识别尚未修复的资本回撤。",
+    "VAR_": "用历史收益分位数估计给定置信水平下的单期损失阈值，不覆盖所有极端风险。",
+}
+
+
+def detailed_indicator_description(definition: IndicatorDefinition) -> str:
+    """Return a calculation, interpretation and limitation oriented description."""
+
+    name = f"{definition.name} {definition.column}".upper()
+    specific = next(
+        (text for key, text in _INDICATOR_EXPLANATIONS.items() if key in name),
+        "该条目基于当前证券的公开 OHLCV、成交额或其滚动统计结果计算，最新值使用最近一个有效交易点。",
+    )
+    dimension = _DIMENSION_EXPLANATIONS.get(definition.category, "应与价格、成交量和市场环境交叉验证。")
+    source = (
+        "这是用户公式生成的本地自定义指标。"
+        if definition.origin == "自定义"
+        else "这是系统指标，计算不依赖交易账户或私有持仓数据。"
+    )
+    base = definition.description.rstrip("。； ")
+    return (
+        f"{base}。计算与解读：{specific}{dimension}"
+        f"{source} 六维评分预设权重 {indicator_weight(definition):.2f}。"
+    )
+
+
 INDICATOR_CATALOG = [
     IndicatorDefinition("趋势", "MA5", "SMA_5", "5日平均价格，反映超短线成本", "元"),
     IndicatorDefinition("趋势", "MA10", "SMA_10", "10日平均价格，反映短线趋势", "元"),
@@ -749,8 +843,16 @@ def dimension_composites(
             for snapshot in snapshots
             if snapshot.definition.category == dimension and snapshot.value is not None
         ]
-        effects = [_snapshot_effect(snapshot) for snapshot in members]
-        score = float(np.clip((float(np.mean(effects)) + 1) * 50, 0, 100)) if effects else 50.0
+        effects = np.asarray([_snapshot_effect(snapshot) for snapshot in members], dtype=float)
+        weights = np.asarray(
+            [indicator_weight(snapshot.definition) for snapshot in members], dtype=float
+        )
+        weighted_effect = (
+            float(np.average(effects, weights=weights))
+            if effects.size and float(weights.sum()) > 0
+            else 0.0
+        )
+        score = float(np.clip((weighted_effect + 1) * 50, 0, 100)) if effects.size else 50.0
         if score >= 67:
             status = "综合偏多"
         elif score >= 56:
@@ -765,6 +867,7 @@ def dimension_composites(
             "score": round(score, 2),
             "status": status,
             "count": len(members),
+            "weight": round(float(weights.sum()), 2),
         }
     return result
 

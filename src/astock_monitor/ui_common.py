@@ -29,6 +29,16 @@ QFrame#TopBar, QFrame#Section, QFrame#Card {
     border: 1px solid #192A40;
     border-radius: 10px;
 }
+QFrame#MainNavigation {
+    background: #081525;
+    border: 0;
+    border-bottom: 1px solid #20324A;
+}
+QFrame#EmptyState {
+    background: #0A1627;
+    border: 1px dashed #2B4260;
+    border-radius: 12px;
+}
 QFrame#TopBar { border-radius: 0; border-left: 0; border-right: 0; border-top: 0; }
 QFrame#ChartControls {
     background: rgba(8, 19, 33, 218);
@@ -36,6 +46,8 @@ QFrame#ChartControls {
     border-radius: 8px;
 }
 QLabel#AppName { font-size: 18px; font-weight: 700; color: #F4F8FD; }
+QLabel#NavigationBrand { font-size: 18px; font-weight: 800; color: #F4F8FD; }
+QLabel#EmptyStateTitle { font-size: 26px; font-weight: 700; color: #DCEAF7; }
 QLabel#PageTitle { font-size: 22px; font-weight: 700; color: #F4F8FD; }
 QLabel#SecurityName { font-size: 24px; font-weight: 700; color: #F4F8FD; }
 QLabel#Price { font-size: 30px; font-weight: 700; }
@@ -72,6 +84,20 @@ QPushButton#Primary:hover { background: #0397DF; }
 QPushButton#Danger { color: #FF8297; border-color: #713044; }
 QPushButton#Ghost { background: transparent; border-color: transparent; padding: 6px 9px; }
 QPushButton#Ghost:hover { background: #12233A; border-color: #263B57; }
+QPushButton#MainNavigationButton {
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    color: #8194AD;
+    padding: 10px 14px 9px 14px;
+}
+QPushButton#MainNavigationButton:hover { color: #DCEAF7; background: #0D1D31; }
+QPushButton#MainNavigationButton:checked {
+    color: #F4F8FD;
+    background: #0D2035;
+    border-bottom-color: #38BDF8;
+}
 QPushButton#SubNavigation {
     background: #0D1B2E;
     color: #8194AD;
