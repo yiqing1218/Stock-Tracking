@@ -10,8 +10,10 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -22,7 +24,12 @@ from .data_provider import (
     MARKET_DASHBOARD_INDICES,
     DataProvider,
     MarketDashboardBundle,
+    infer_market,
 )
+from .historical_store import HistoricalStore
+from .market_analysis import MarketAnalysisService
+from .models import Security, SecurityType
+from .repository import Repository
 from .time_utils import beijing_now
 from .ui_common import (
     DOWN_COLOR,
@@ -46,10 +53,15 @@ class MarketDashboardPage(QWidget):
         provider: DataProvider,
         thread_pool: QThreadPool,
         parent: QWidget | None = None,
+        repository: Repository | None = None,
+        store: HistoricalStore | None = None,
     ) -> None:
         super().__init__(parent)
         self.provider = provider
         self.thread_pool = thread_pool
+        self.repository = repository
+        self.store = store
+        self.market_analysis = MarketAnalysisService(store) if store is not None else None
         self._running = False
         self._active_workers: set[Worker] = set()
         self._boards = pd.DataFrame()
@@ -59,7 +71,12 @@ class MarketDashboardPage(QWidget):
         self.timer.timeout.connect(self.refresh)
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.market_tabs = QTabWidget()
+        self.market_tabs.setDocumentMode(True)
+        overview_page = QWidget()
+        root = QVBoxLayout(overview_page)
         root.setContentsMargins(18, 14, 18, 14)
         root.setSpacing(12)
 
@@ -115,7 +132,9 @@ class MarketDashboardPage(QWidget):
             "down": MetricCard("下跌家数"),
             "limit_up": MetricCard("涨停家数"),
             "limit_down": MetricCard("跌停家数"),
+            "broken_limit": MetricCard("炸板 / 最高连板"),
             "median_change": MetricCard("全A中位涨幅"),
+            "market_score": MetricCard("澄鉴市场评分"),
             "amount": MetricCard("全A成交额"),
         }
         for card in self.breadth_cards.values():
@@ -165,8 +184,13 @@ class MarketDashboardPage(QWidget):
         movers_panel.setObjectName("Section")
         movers_layout = QHBoxLayout(movers_panel)
         movers_layout.setContentsMargins(12, 12, 12, 12)
-        self.gainer_table = self._mover_table("涨幅前列")
-        self.loser_table = self._mover_table("跌幅前列")
+        self.gainer_table = self._mover_table("涨幅前列（25只）")
+        self.loser_table = self._mover_table("跌幅前列（25只）")
+        for table in (self.gainer_table, self.loser_table):
+            table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            table.customContextMenuRequested.connect(
+                lambda position, current=table: self._show_mover_menu(current, position)
+            )
         movers_layout.addWidget(self.gainer_table)
         movers_layout.addWidget(self.loser_table)
         lower.addWidget(movers_panel)
@@ -180,6 +204,255 @@ class MarketDashboardPage(QWidget):
         note.setObjectName("Tiny")
         note.setWordWrap(True)
         root.addWidget(note)
+        self.market_tabs.addTab(overview_page, "市场总览")
+        self.board_explorers: dict[str, tuple[QTableWidget, QTableWidget, QLabel]] = {}
+        self.relative_controls: dict[
+            str, tuple[QComboBox, QComboBox, QLabel]
+        ] = {}
+        self.market_tabs.addTab(self._build_board_explorer("行业"), "行业板块")
+        self.market_tabs.addTab(self._build_board_explorer("概念"), "概念板块")
+        outer.addWidget(self.market_tabs)
+
+    def _build_board_explorer(self, board_type: str) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.addWidget(
+            section_title(
+                f"{board_type}板块",
+                "分类来源不混合；历史从本程序首次观测日起保存，不回填虚构历史",
+            )
+        )
+        status = QLabel("等待市场总览刷新后载入本地板块快照。")
+        status.setObjectName("Muted")
+        layout.addWidget(status)
+        relative = QHBoxLayout()
+        relative.addWidget(QLabel("相对强弱"))
+        security_combo = QComboBox()
+        security_combo.setMinimumWidth(180)
+        benchmark_combo = QComboBox()
+        benchmark_combo.addItem("对沪深300", "hs300")
+        benchmark_combo.addItem(f"对当前{board_type}板块", "board")
+        calculate_button = QPushButton("计算5/20/60日")
+        result_label = QLabel("需先在本地仓库同步证券及基准历史。")
+        result_label.setObjectName("Muted")
+        calculate_button.clicked.connect(
+            lambda checked=False, kind=board_type: self._calculate_relative_strength(
+                kind
+            )
+        )
+        relative.addWidget(security_combo)
+        relative.addWidget(benchmark_combo)
+        relative.addWidget(calculate_button)
+        relative.addWidget(result_label, 1)
+        layout.addLayout(relative)
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        table = QTableWidget(0, 9)
+        table.setHorizontalHeaderLabels(
+            ["板块", "涨跌幅", "澄鉴热度", "上涨", "下跌", "成交额", "资金净流入", "分类来源", "历史起点"]
+        )
+        configure_table(table)
+        table.setSortingEnabled(True)
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda position, kind=board_type: self._show_board_menu(kind, position)
+        )
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        history = QTableWidget()
+        configure_table(history)
+        table.cellClicked.connect(
+            lambda row, _column, kind=board_type: self._show_board_history(kind, row)
+        )
+        splitter.addWidget(table)
+        splitter.addWidget(history)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
+        explanation = QLabel(
+            "澄鉴热度=当日涨幅排名40%+换手排名20%+涨跌宽度20%+成交额排名10%+资金流排名10%；"
+            "只有来源存在相应字段时才参与，缺失项按中性分处理。"
+        )
+        explanation.setObjectName("Tiny")
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        self.board_explorers[board_type] = (table, history, status)
+        self.relative_controls[board_type] = (
+            security_combo,
+            benchmark_combo,
+            result_label,
+        )
+        return page
+
+    def _refresh_board_explorers(self) -> None:
+        if self.market_analysis is None:
+            return
+        self._reload_relative_targets()
+        for board_type, (table, history, status) in self.board_explorers.items():
+            rows = self.market_analysis.list_boards(board_type)
+            table.setSortingEnabled(False)
+            table.setRowCount(len(rows))
+            for row_index, row in enumerate(rows):
+                numeric_values = (
+                    None,
+                    self._number(row["change_pct"]),
+                    self._number(row["chengjian_heat"]),
+                    self._number(row["up_count"]),
+                    self._number(row["down_count"]),
+                    self._number(row["amount"]),
+                    self._number(row["fund_flow"]),
+                    None,
+                    None,
+                )
+                values = (
+                    row["board_name"],
+                    format_percent(self._number(row["change_pct"])),
+                    format_number(self._number(row["chengjian_heat"]), decimals=1),
+                    format_number(self._number(row["up_count"]), decimals=0),
+                    format_number(self._number(row["down_count"]), decimals=0),
+                    format_number(self._number(row["amount"])),
+                    format_number(self._number(row["fund_flow"])),
+                    row["classification_source"],
+                    row["first_date"] or "—",
+                )
+                for column, value in enumerate(values):
+                    numeric = numeric_values[column]
+                    item = (
+                        SortableTableWidgetItem(str(value), numeric)
+                        if numeric is not None
+                        else QTableWidgetItem(str(value))
+                    )
+                    item.setData(Qt.ItemDataRole.UserRole, int(row["id"]))
+                    table.setItem(row_index, column, item)
+            table.setSortingEnabled(True)
+            table.sortItems(1, Qt.SortOrder.DescendingOrder)
+            history.setRowCount(0)
+            status.setText(f"本地已保存 {len(rows)} 个{board_type}板块的最新快照。")
+
+    def _reload_relative_targets(self) -> None:
+        if self.repository is None:
+            return
+        securities = self.repository.list_watchlist()
+        for security_combo, _benchmark, _result in self.relative_controls.values():
+            current = security_combo.currentData()
+            current_key = current.key if isinstance(current, Security) else ""
+            security_combo.clear()
+            for security in securities:
+                security_combo.addItem(
+                    f"{security.name} {security.code}", security
+                )
+            if current_key:
+                for index in range(security_combo.count()):
+                    value = security_combo.itemData(index)
+                    if isinstance(value, Security) and value.key == current_key:
+                        security_combo.setCurrentIndex(index)
+                        break
+
+    def _calculate_relative_strength(self, board_type: str) -> None:
+        if self.market_analysis is None:
+            return
+        security_combo, benchmark_combo, result_label = self.relative_controls[
+            board_type
+        ]
+        security = security_combo.currentData()
+        if not isinstance(security, Security):
+            result_label.setText("自选列表中没有可计算证券。")
+            return
+        if benchmark_combo.currentData() == "board":
+            table = self.board_explorers[board_type][0]
+            row = table.currentRow()
+            item = table.item(row, 0) if row >= 0 else None
+            if item is None:
+                result_label.setText(f"请先选择一个{board_type}板块。")
+                return
+            values = self.market_analysis.relative_strength_to_board(
+                security, int(item.data(Qt.ItemDataRole.UserRole))
+            )
+            benchmark_name = item.text()
+        else:
+            benchmark = Security("000300", "沪深300", SecurityType.INDEX, "csi")
+            values = self.market_analysis.relative_strength(security, benchmark)
+            benchmark_name = "沪深300"
+        parts = [
+            f"{period} {value:+.2f}%" if value is not None else f"{period} 数据不足"
+            for period, value in values.items()
+        ]
+        result_label.setText(f"相对{benchmark_name}：" + " · ".join(parts))
+
+    def _show_board_history(self, board_type: str, row: int) -> None:
+        if self.market_analysis is None:
+            return
+        table, history, status = self.board_explorers[board_type]
+        item = table.item(row, 0)
+        if item is None:
+            return
+        frame = self.market_analysis.board_history(
+            int(item.data(Qt.ItemDataRole.UserRole))
+        )
+        history.setColumnCount(len(frame.columns))
+        history.setHorizontalHeaderLabels([str(column) for column in frame.columns])
+        history.setRowCount(len(frame))
+        for row_index, (_, values) in enumerate(frame.iterrows()):
+            for column, name in enumerate(frame.columns):
+                history.setItem(row_index, column, QTableWidgetItem(str(values[name])))
+        status.setText(f"{item.text()}：{len(frame)} 个本地交易日观测。")
+
+    def _show_board_menu(self, board_type: str, position) -> None:  # type: ignore[no-untyped-def]
+        if self.market_analysis is None:
+            return
+        table, _history, _status = self.board_explorers[board_type]
+        row = table.rowAt(position.y())
+        item = table.item(row, 0) if row >= 0 else None
+        if item is None:
+            return
+        menu = QMenu(self)
+        sync = menu.addAction("同步并显示当前成分股")
+        selected = menu.exec(table.viewport().mapToGlobal(position))
+        if selected is not sync:
+            return
+        board_id = int(item.data(Qt.ItemDataRole.UserRole))
+        board_name = item.text()
+        worker = Worker(self._sync_board_members, board_id)
+        self._active_workers.add(worker)
+        worker.signals.result.connect(
+            lambda value, kind=board_type, name=board_name: self._show_board_members(
+                kind, name, value
+            )
+        )
+        worker.signals.error.connect(
+            lambda message, kind=board_type: self.board_explorers[kind][2].setText(
+                f"成分同步失败：{message}"
+            )
+        )
+        worker.signals.finished.connect(
+            lambda current=worker: self._active_workers.discard(current)
+        )
+        self.board_explorers[board_type][2].setText(
+            f"正在同步 {board_name} 当前成分；不会覆盖历史成员区间…"
+        )
+        self.thread_pool.start(worker)
+
+    def _sync_board_members(self, board_id: int) -> tuple[int, list[dict]]:
+        if self.market_analysis is None:
+            return 0, []
+        count = self.market_analysis.sync_board_members(board_id)
+        return count, self.market_analysis.board_members(board_id)
+
+    def _show_board_members(
+        self, board_type: str, board_name: str, value: object
+    ) -> None:
+        if not isinstance(value, tuple) or len(value) != 2:
+            return
+        count, rows = value
+        _table, detail, status = self.board_explorers[board_type]
+        columns = ["代码", "名称", "市场", "权重", "生效起点", "来源"]
+        detail.setColumnCount(len(columns))
+        detail.setHorizontalHeaderLabels(columns)
+        detail.setRowCount(len(rows))
+        keys = ("code", "name", "market", "weight", "effective_from", "source")
+        for row_index, row in enumerate(rows):
+            for column, key in enumerate(keys):
+                detail.setItem(row_index, column, QTableWidgetItem(str(row.get(key) or "—")))
+        status.setText(f"{board_name}：同步并保存 {count} 只当前成分股。")
 
     @staticmethod
     def _mover_table(title: str) -> QTableWidget:
@@ -246,9 +519,22 @@ class MarketDashboardPage(QWidget):
         self.breadth_cards["limit_down"].set_value(
             str(int(breadth.get("limit_down", 0))), "逐只按跌停价统计", DOWN_COLOR
         )
+        self.breadth_cards["broken_limit"].set_value(
+            f"{int(breadth.get('broken_limit', 0))} / "
+            + (
+                str(int(breadth["max_limit_streak"]))
+                if breadth.get("max_limit_streak") is not None
+                else "—"
+            ),
+            "盘中炸板家数 / 涨停池真实连板字段",
+        )
         median = float(breadth.get("median_change", 0.0))
         self.breadth_cards["median_change"].set_value(
             format_percent(median), "中位数", change_color(median)
+        )
+        market_score = MarketAnalysisService.market_score(breadth)
+        self.breadth_cards["market_score"].set_value(
+            f"{market_score:.0f}/100", "宽度60% · 中位25% · 涨停生态15%"
         )
         self.breadth_cards["amount"].set_value(
             format_number(float(breadth.get("amount", 0.0))), "沪深京合计"
@@ -258,6 +544,12 @@ class MarketDashboardPage(QWidget):
         self._filter_boards()
         self._fill_movers(self.gainer_table, result.gainers)
         self._fill_movers(self.loser_table, result.losers)
+        if self.market_analysis is not None:
+            try:
+                self.market_analysis.persist_dashboard(result)
+                self._refresh_board_explorers()
+            except Exception as exc:
+                result.warnings.append(f"本地市场快照保存失败：{exc}")
         now = beijing_now()
         warning = f" · {len(result.warnings)} 个数据源回退" if result.warnings else ""
         trade_date = (
@@ -335,6 +627,13 @@ class MarketDashboardPage(QWidget):
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
+                item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    {
+                        "code": str(row.get("代码", "")).zfill(6),
+                        "name": str(row.get("名称", "")),
+                    },
+                )
                 if column == 2:
                     item.setForeground(QColor(change_color(change)))
                 if column > 0:
@@ -342,6 +641,34 @@ class MarketDashboardPage(QWidget):
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                     )
                 table.setItem(row_index, column, item)
+
+    def _show_mover_menu(self, table: QTableWidget, position) -> None:  # type: ignore[no-untyped-def]
+        if self.repository is None:
+            return
+        row = table.rowAt(position.y())
+        item = table.item(row, 0) if row >= 0 else None
+        value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if not isinstance(value, dict) or not value.get("code"):
+            return
+        code = str(value["code"])
+        security = Security(
+            code,
+            str(value.get("name") or code),
+            SecurityType.STOCK,
+            infer_market(code, SecurityType.STOCK),
+        )
+        menu = QMenu(self)
+        group_menu = menu.addMenu("加入自选分组")
+        actions = {}
+        for group in self.repository.list_groups():
+            action = group_menu.addAction(group.name)
+            actions[action] = group.id
+        selected = menu.exec(table.viewport().mapToGlobal(position))
+        if selected in actions:
+            self.repository.add_security(security, actions[selected])
+            self.status_label.setText(
+                f"已将 {security.name} {security.code} 加入自选分组"
+            )
 
     def _on_error(self, message: str) -> None:
         self.status_label.setText(f"大盘数据加载失败：{message}")

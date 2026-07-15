@@ -88,15 +88,23 @@ class MainWindow(QMainWindow):
         shell_layout.addWidget(navigation)
 
         self.stack = QStackedWidget()
-        self.market_page = MarketDashboardPage(provider, self.thread_pool)
         self.historical_store = HistoricalStore(repository.database_path)
+        self.market_page = MarketDashboardPage(
+            provider, self.thread_pool, repository=repository, store=self.historical_store
+        )
         self.screening_page = ScreeningPage(
             repository, provider, self.thread_pool, self.historical_store
         )
         self.watchlist_page = WatchlistPage(repository, provider, self.thread_pool)
-        self.detail_page = DetailPage(repository, provider, self.thread_pool)
+        self.detail_page = DetailPage(
+            repository, provider, self.thread_pool, self.historical_store
+        )
         self.strategy_page = StrategyBacktestPage(
-            repository, provider, self.thread_pool, self.detail_page.custom_tab
+            repository,
+            provider,
+            self.thread_pool,
+            self.detail_page.custom_tab,
+            self.historical_store,
         )
         self.alerts_page = MessagePage(repository, provider, self.thread_pool)
         self.data_page = DataManagementPage(

@@ -34,6 +34,7 @@ COLORS = {
 
 class MarketChart(QWidget):
     date_activated = Signal(object)
+    event_activated = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -52,6 +53,7 @@ class MarketChart(QWidget):
         self._last_plot_rect = QRectF()
         self._visible_frame = pd.DataFrame()
         self._event_markers = pd.DataFrame()
+        self._marker_hits: list[tuple[QRectF, dict]] = []
         self._overlay_columns = ["SMA_5", "SMA_20", "BB_UPPER", "BB_LOWER"]
 
     def sizeHint(self) -> QSize:
@@ -80,6 +82,7 @@ class MarketChart(QWidget):
         self._event_markers = (
             event_markers.copy() if event_markers is not None else pd.DataFrame()
         )
+        self._marker_hits = []
         self._visible_count = min(max(40, self._visible_count), max(40, len(frame)))
         self._right_offset = 0
         self.update()
@@ -90,6 +93,7 @@ class MarketChart(QWidget):
         self._reference_price = None
         self._percentage_axis = False
         self._visible_frame = pd.DataFrame()
+        self._marker_hits = []
         self._right_offset = 0
         self.update()
 
@@ -166,6 +170,11 @@ class MarketChart(QWidget):
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        for bounds, marker in self._marker_hits:
+            if bounds.adjusted(-4, -4, 4, 4).contains(event.position()):
+                self.event_activated.emit(marker)
+                event.accept()
+                return
         if (
             event.button() == Qt.MouseButton.LeftButton
             and not self._visible_frame.empty
@@ -263,11 +272,12 @@ class MarketChart(QWidget):
         spacing = rect.width() / max(len(frame), 1)
         painter.save()
         painter.setClipRect(rect)
+        self._marker_hits = []
         painter.setFont(QFont("Microsoft YaHei UI", 8))
-        for _, marker in self._event_markers.iterrows():
-            marker_date = pd.to_datetime(marker.get("date"), errors="coerce")
-            if pd.isna(marker_date):
-                continue
+        markers = self._event_markers.copy()
+        markers["_date"] = pd.to_datetime(markers["date"], errors="coerce").dt.normalize()
+        markers = markers.dropna(subset=["_date"])
+        for marker_date, group in markers.groupby("_date", sort=False):
             matches = np.flatnonzero(dates.eq(marker_date.normalize()).to_numpy())
             if not len(matches):
                 continue
@@ -275,7 +285,23 @@ class MarketChart(QWidget):
             painter.setPen(QPen(QColor("#F59E0B"), 1, Qt.PenStyle.DashLine))
             painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
             painter.setPen(QColor("#FBBF24"))
-            painter.drawText(QPointF(x + 3, rect.top() + 13), "除权/分红")
+            labels = [
+                str(value).strip()
+                for value in group.get("label", pd.Series(dtype=str)).tolist()
+                if str(value).strip() and str(value).lower() != "nan"
+            ]
+            label = labels[0] if labels else "除权/分红"
+            if len(group) > 1:
+                label = f"{label}+{len(group) - 1}"
+            display = label[:12]
+            painter.drawText(QPointF(x + 3, rect.top() + 13), display)
+            width = painter.fontMetrics().horizontalAdvance(display)
+            self._marker_hits.append(
+                (
+                    QRectF(x, rect.top(), width + 8, 18),
+                    group.iloc[0].drop(labels=["_date"]).to_dict(),
+                )
+            )
         painter.restore()
 
     def _draw_header(

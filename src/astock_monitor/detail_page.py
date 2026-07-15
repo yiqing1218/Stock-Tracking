@@ -6,7 +6,7 @@ import sqlite3
 from datetime import timedelta
 
 import pandas as pd
-from PySide6.QtCore import QDate, QThreadPool, Qt, QUrl, Signal
+from PySide6.QtCore import QDate, QThreadPool, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -37,8 +37,11 @@ from PySide6.QtWidgets import (
 from .analytics_widgets import ChipDistributionWidget, FinancialChartWidget
 from .alerts import AlertSettingsWidget
 from .chart_widget import MarketChart
+from .company_events import CompanyEventService
 from .data_provider import DataProvider, DetailBundle
+from .event_timeline import EventTimelineWidget
 from .formula_engine import FORMULA_HELP, FormulaEngine, FormulaError
+from .historical_store import HistoricalStore
 from .candlestick_patterns import PATTERNS, detect_patterns
 from .financial_analysis import analyze_financial_frame, financial_quality_flags
 from .indicators import (
@@ -78,12 +81,19 @@ class DetailPage(QWidget):
         repository: Repository,
         provider: DataProvider,
         thread_pool: QThreadPool,
+        historical_store: HistoricalStore | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.repository = repository
         self.provider = provider
         self.thread_pool = thread_pool
+        self.historical_store = historical_store or HistoricalStore(
+            repository.database_path
+        )
+        self.company_event_service = CompanyEventService(
+            self.historical_store, repository
+        )
         self.security: Security | None = None
         self.bundle: DetailBundle | None = None
         self.indicator_frame = pd.DataFrame()
@@ -107,6 +117,12 @@ class DetailPage(QWidget):
         self._active_workers: set[Worker] = set()
         self.indicator_favorites: set[str] = set()
         self.news_articles: list[NewsArticle] = []
+        self.company_event_markers = pd.DataFrame()
+        self._intraday_debounce = QTimer(self)
+        self._intraday_debounce.setSingleShot(True)
+        self._intraday_debounce.setInterval(180)
+        self._intraday_debounce.timeout.connect(self._load_intraday)
+        self._suspend_intraday_auto = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -166,6 +182,13 @@ class DetailPage(QWidget):
         self.news_tab = self._build_news_tab()
         self.custom_tab = self._build_custom_tab()
         self.alert_settings_tab = AlertSettingsWidget(self.repository)
+        self.event_timeline_tab = EventTimelineWidget(
+            self.company_event_service, self.thread_pool
+        )
+        self.event_timeline_tab.events_changed.connect(
+            self._on_company_events_changed
+        )
+        self.market_chart.event_activated.connect(self._open_company_event)
         self.market_workspace = self._build_market_workspace()
         detail_pages = self._split_fundamental_pages()
         self.order_book_tab = self._build_order_book_tab()
@@ -177,6 +200,7 @@ class DetailPage(QWidget):
         self.tabs.addTab(self.order_book_tab, "盘口")
         self.tabs.addTab(detail_pages["finance"], "财务")
         self.tabs.addTab(self.news_tab, "企业公告/新闻/资讯")
+        self.tabs.addTab(self.event_timeline_tab, "公司事件")
         self.tabs.addTab(self.alert_settings_tab, "行情提醒设置")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
@@ -190,6 +214,7 @@ class DetailPage(QWidget):
         self.market_modes.addTab(self.intraday_tab, "分时（可选日期）")
         self.market_modes.addTab(self.overview_tab, "K线")
         self.market_modes.setCurrentWidget(self.overview_tab)
+        self.market_modes.currentChanged.connect(self._on_market_mode_changed)
         layout.addWidget(self.market_modes)
         return page
 
@@ -483,11 +508,15 @@ class DetailPage(QWidget):
         for minutes in ("1", "5", "15", "30", "60"):
             self.intraday_period.addItem(f"{minutes} 分钟", minutes)
         self.intraday_period.setCurrentIndex(0)
+        self.intraday_date.dateChanged.connect(self._schedule_intraday_load)
+        self.intraday_period.currentIndexChanged.connect(
+            self._schedule_intraday_load
+        )
         controls.addWidget(self.intraday_period)
+        # Compatibility handle for older integrations. It is deliberately not added
+        # to the layout: date/period changes now trigger loading automatically.
         self.intraday_button = QPushButton("加载分时")
-        self.intraday_button.setObjectName("Primary")
-        self.intraday_button.clicked.connect(self._load_intraday)
-        controls.addWidget(self.intraday_button)
+        self.intraday_button.hide()
         controls.addStretch(1)
         self.intraday_status = QLabel("支持历史分时与北京时间当日实时分时；默认1分钟。")
         self.intraday_status.setObjectName("Muted")
@@ -927,6 +956,7 @@ class DetailPage(QWidget):
 
         self.security = None
         self.alert_settings_tab.set_security(None)
+        self.event_timeline_tab.set_security(None)
         self.bundle = None
         self.indicator_frame = pd.DataFrame()
         self.snapshots = []
@@ -996,6 +1026,7 @@ class DetailPage(QWidget):
     def load_security(self, security: Security) -> None:
         self.security = security
         self.alert_settings_tab.set_security(security)
+        self.event_timeline_tab.set_security(security)
         self.bundle = None
         self.indicator_frame = pd.DataFrame()
         self.snapshots = []
@@ -1030,14 +1061,16 @@ class DetailPage(QWidget):
         )
         today = beijing_today()
         beijing_qdate = QDate(today.year, today.month, today.day)
+        self._suspend_intraday_auto = True
         self.intraday_date.setMaximumDate(beijing_qdate)
         self.intraday_date.setDate(beijing_qdate)
         self.intraday_period.setCurrentIndex(0)
+        self._suspend_intraday_auto = False
         self._update_watchlist_button()
         self.market_chart.clear()
         self.chip_detail_chart.clear()
         self.intraday_chart.clear()
-        self.intraday_status.setText("请选择交易日并点击“加载分时”。")
+        self.intraday_status.setText("正在准备自动加载当日分时…")
         self.company_table.setRowCount(0)
         self.business_table.setRowCount(0)
         self.financial_table.setRowCount(0)
@@ -1081,6 +1114,7 @@ class DetailPage(QWidget):
         self.loading_label.setToolTip(warnings)
         self._update_header()
         self._update_overview()
+        self._schedule_intraday_load()
         self._populate_indicators()
         self._populate_patterns()
         self._reload_formula_list()
@@ -1136,6 +1170,29 @@ class DetailPage(QWidget):
             self._ensure_extended_indicators()
         if self.tabs.currentWidget() is self.order_book_tab:
             self._load_order_book()
+        if self.tabs.currentWidget() is self.event_timeline_tab:
+            self.event_timeline_tab.sync_if_needed()
+
+    def _on_market_mode_changed(self, _index: int) -> None:
+        if self.market_modes.currentWidget() is self.intraday_tab:
+            self._schedule_intraday_load()
+
+    def _schedule_intraday_load(self, *_args: object) -> None:
+        if self.security is not None and not self._suspend_intraday_auto:
+            self._intraday_debounce.start()
+
+    def _on_company_events_changed(self, value: object) -> None:
+        self.company_event_markers = (
+            value.copy() if isinstance(value, pd.DataFrame) else pd.DataFrame()
+        )
+        if not self.indicator_frame.empty:
+            self._update_charts()
+
+    def _open_company_event(self, value: object) -> None:
+        if not isinstance(value, dict) or not value.get("event_id"):
+            return
+        self.tabs.setCurrentWidget(self.event_timeline_tab)
+        self.event_timeline_tab.focus_event(int(value["event_id"]))
 
     def _ensure_extended_indicators(self) -> None:
         if (
@@ -1356,7 +1413,7 @@ class DetailPage(QWidget):
         self.intraday_period.setCurrentIndex(max(0, period_index))
         self.tabs.setCurrentWidget(self.market_workspace)
         self.market_modes.setCurrentWidget(self.intraday_tab)
-        self._load_intraday()
+        self._schedule_intraday_load()
 
     def _load_order_book(self) -> None:
         if self.security is None or getattr(self, "_order_book_running", False):
@@ -1417,8 +1474,18 @@ class DetailPage(QWidget):
             market_frame = calculate_indicators(market_history, include_extended=False)
         else:
             market_frame = self._visible_frame()
-        markers = (
+        action_markers = (
             self.bundle.corporate_actions if self.bundle is not None else pd.DataFrame()
+        )
+        marker_frames = [
+            frame
+            for frame in (action_markers, self.company_event_markers)
+            if not frame.empty
+        ]
+        markers = (
+            pd.concat(marker_frames, ignore_index=True)
+            if marker_frames
+            else pd.DataFrame()
         )
         lower_column = str(self.lower_indicator_combo.currentData() or "MACD_DIF")
         lower_series = market_frame.get(lower_column)
@@ -2054,7 +2121,6 @@ class DetailPage(QWidget):
         security = self.security
         trading_day = self.intraday_date.date().toPython()
         period = str(self.intraday_period.currentData())
-        self.intraday_button.setEnabled(False)
         self.intraday_status.setText(
             f"正在加载 {trading_day:%Y-%m-%d} 的 {period} 分钟数据…"
         )

@@ -388,6 +388,10 @@ class DataProvider:
                 (column for column in ("昨收", "前收盘") if column in spot),
                 None,
             )
+            high_column = next(
+                (column for column in ("最高", "最高价") if column in spot),
+                None,
+            )
             timestamp_column = next(
                 (column for column in ("更新时间戳", "时间戳") if column in spot),
                 None,
@@ -441,6 +445,12 @@ class DataProvider:
                 )
                 limit_up = 0
                 limit_down = 0
+                broken_limit = 0
+                highs = (
+                    pd.to_numeric(spot[high_column], errors="coerce")
+                    if high_column
+                    else pd.Series(np.nan, index=spot.index)
+                )
                 for row_index in spot.index:
                     prev = _as_float(previous.get(row_index))
                     price = _as_float(prices.get(row_index))
@@ -455,13 +465,22 @@ class DataProvider:
                     lower = self._rounded_limit_price(prev, 1 - rate)
                     limit_up += int(price >= upper - 0.005)
                     limit_down += int(price <= lower + 0.005)
+                    high = _as_float(highs.get(row_index))
+                    broken_limit += int(
+                        high is not None
+                        and high >= upper - 0.005
+                        and price < upper - 0.005
+                    )
                 bundle.breadth = {
                     "up": int((valid > 0).sum()),
                     "down": int((valid < 0).sum()),
                     "flat": int((valid == 0).sum()),
                     "limit_up": limit_up,
                     "limit_down": limit_down,
+                    "broken_limit": broken_limit,
                     "median_change": float(valid.median()) if not valid.empty else 0.0,
+                    "equal_weight_return": float(valid.mean()) if not valid.empty else 0.0,
+                    "market_volatility": float(valid.std(ddof=0)) if not valid.empty else 0.0,
                     "amount": float(amounts.sum()) if not amounts.empty else 0.0,
                 }
                 if code_column and name_column and price_column:
@@ -475,11 +494,41 @@ class DataProvider:
                         }
                     ).dropna(subset=["涨跌幅", "最新价"])
                     movers = movers[(movers["成交额"] > 0) & (movers["最新价"] > 0)]
-                    bundle.gainers = movers.nlargest(8, "涨跌幅").reset_index(drop=True)
-                    bundle.losers = movers.nsmallest(8, "涨跌幅").reset_index(drop=True)
+                    bundle.gainers = movers.nlargest(25, "涨跌幅").reset_index(drop=True)
+                    bundle.losers = movers.nsmallest(25, "涨跌幅").reset_index(drop=True)
             bundle.sources["breadth"] = str(
                 spot.attrs.get("source", "AkShare·东方财富A股快照/本地缓存")
             )
+
+        if bundle.trade_date is not None and bundle.breadth:
+            trade_date_text = bundle.trade_date.strftime("%Y%m%d")
+            try:
+                limit_pool = self._load_extra_with_cache(
+                    "market_limit_pool",
+                    trade_date_text,
+                    lambda: ak.stock_zt_pool_em(date=trade_date_text),
+                    timedelta(minutes=3),
+                )
+                streak_column = next(
+                    (
+                        column
+                        for column in ("连板数", "连板统计", "涨停统计")
+                        if column in limit_pool
+                    ),
+                    None,
+                )
+                if streak_column and not limit_pool.empty:
+                    streaks = (
+                        limit_pool[streak_column]
+                        .astype(str)
+                        .str.extract(r"(\d+)", expand=False)
+                    )
+                    values = pd.to_numeric(streaks, errors="coerce").dropna()
+                    if not values.empty:
+                        bundle.breadth["max_limit_streak"] = int(values.max())
+                bundle.sources["limit_pool"] = "AkShare·东方财富涨停池"
+            except Exception as exc:
+                bundle.warnings.append(f"涨停生态: {exc}")
 
         boards = frames.get("boards", pd.DataFrame())
         if not boards.empty:
