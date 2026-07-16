@@ -115,6 +115,7 @@ def _row_float(row: pd.Series, *names: str) -> float | None:
 class DetailBundle:
     security: Security
     history: pd.DataFrame
+    quote: Quote | None = None
     fund_flow: pd.DataFrame = field(default_factory=pd.DataFrame)
     chips: pd.DataFrame = field(default_factory=pd.DataFrame)
     holders: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -125,6 +126,7 @@ class DetailBundle:
     profit_sheet: pd.DataFrame = field(default_factory=pd.DataFrame)
     cash_flow_sheet: pd.DataFrame = field(default_factory=pd.DataFrame)
     corporate_actions: pd.DataFrame = field(default_factory=pd.DataFrame)
+    peer_valuation: pd.DataFrame = field(default_factory=pd.DataFrame)
     sources: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -150,6 +152,7 @@ class DataProvider:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.history_sources: dict[str, str] = {}
         self.historical_store: HistoricalStore | None = None
+        self.latest_quotes: dict[str, Quote] = {}
 
     def attach_store(self, store: HistoricalStore) -> None:
         """Use SQLite as the durable source of truth; files remain short-lived fallback."""
@@ -901,8 +904,8 @@ class DataProvider:
     def _fetch_direct_quote(self, security: Security) -> Quote:
         errors: list[str] = []
         for source, loader in (
-            ("腾讯行情", self._fetch_tencent_quote),
             ("东方财富", self._fetch_eastmoney_quote),
+            ("腾讯行情", self._fetch_tencent_quote),
             ("新浪行情", self._fetch_sina_quote),
         ):
             try:
@@ -910,6 +913,7 @@ class DataProvider:
                 if quote.price is None:
                     raise RuntimeError("未返回最新价")
                 quote.extra["source"] = source
+                self.latest_quotes[security.key] = quote
                 return quote
             except Exception as exc:
                 errors.append(f"{source}: {exc}")
@@ -1012,6 +1016,8 @@ class DataProvider:
             else None,
             pb=_as_float(values[46]) if len(values) > 46 else None,
         )
+        if quote.high is not None and quote.low is not None and previous_close:
+            quote.amplitude = (quote.high - quote.low) / previous_close * 100
         if len(values) > 30 and re.fullmatch(r"\d{14}", values[30] or ""):
             timestamp = datetime.strptime(values[30], "%Y%m%d%H%M%S").replace(
                 tzinfo=ZoneInfo("Asia/Shanghai")
@@ -1298,10 +1304,17 @@ class DataProvider:
             if not stored.empty
             else None
         )
+        requested_coverage = str(state.get("coverage_start", ""))
+        coverage_complete = bool(
+            requested_coverage and requested_coverage <= start.isoformat()
+        )
         if use_cache and not stored.empty and (
-            latest_stored is not None
-            and latest_stored >= completed_end
-            or last_attempt == end.isoformat()
+            coverage_complete
+            and (
+                latest_stored is not None
+                and latest_stored >= completed_end
+                or last_attempt == end.isoformat()
+            )
         ):
             self.history_sources[security.key] = "本地数据库"
             return (
@@ -1325,6 +1338,21 @@ class DataProvider:
                         effective_adjustment,
                         "旧版CSV缓存迁移",
                     )
+                    if not completed.empty:
+                        store.update_fetch_state(
+                            security,
+                            "daily_bars",
+                            state_key,
+                            success=True,
+                            coverage_start=pd.Timestamp(
+                                completed.iloc[0]["date"]
+                            ).strftime("%Y-%m-%d"),
+                            coverage_end=pd.Timestamp(
+                                completed.iloc[-1]["date"]
+                            ).strftime("%Y-%m-%d"),
+                            record_count=len(completed),
+                            source="旧版CSV缓存迁移",
+                        )
                 self.history_sources[security.key] = "本地缓存"
                 return (
                     self._merge_live_daily_bar(security, cached, effective_adjustment)
@@ -1452,9 +1480,7 @@ class DataProvider:
                         "daily_bars",
                         state_key,
                         success=True,
-                        coverage_start=pd.Timestamp(
-                            completed.iloc[0]["date"]
-                        ).strftime("%Y-%m-%d"),
+                        coverage_start=start.isoformat(),
                         coverage_end=pd.Timestamp(
                             completed.iloc[-1]["date"]
                         ).strftime("%Y-%m-%d"),
@@ -1628,8 +1654,52 @@ class DataProvider:
         adjustment: str = "qfq",
         include_extras: bool = True,
     ) -> DetailBundle:
-        history = self.get_history(security, adjustment=adjustment, include_live=True)
-        bundle = DetailBundle(security=security, history=history)
+        effective_adjustment = (
+            "" if security.security_type is SecurityType.INDEX else adjustment
+        )
+        stored_all = (
+            self.historical_store.get_bars(
+                security,
+                effective_adjustment,
+                end=latest_completed_market_day(),
+            )
+            if self.historical_store is not None
+            else pd.DataFrame()
+        )
+        stored_latest = (
+            pd.Timestamp(stored_all.iloc[-1]["date"]).date()
+            if not stored_all.empty
+            else None
+        )
+        if stored_latest is None or stored_latest < latest_completed_market_day():
+            self.get_history(
+                security,
+                adjustment=adjustment,
+                include_live=False,
+            )
+            stored_all = (
+                self.historical_store.get_bars(
+                    security,
+                    effective_adjustment,
+                    end=latest_completed_market_day(),
+                )
+                if self.historical_store is not None
+                else pd.DataFrame()
+            )
+        if not stored_all.empty:
+            self.history_sources[security.key] = "本地数据库（全部已下载历史）"
+            history = self._merge_live_daily_bar(
+                security, stored_all, effective_adjustment
+            )
+        else:
+            history = self.get_history(
+                security, adjustment=adjustment, include_live=True
+            )
+        bundle = DetailBundle(
+            security=security,
+            history=history,
+            quote=self.latest_quotes.get(security.key),
+        )
         bundle.sources["日线"] = self.history_sources.get(security.key, "未知")
         if not include_extras:
             return bundle
@@ -1726,6 +1796,13 @@ class DataProvider:
                 timedelta(hours=24),
                 "AkShare·分红送配",
             ),
+            (
+                "peer_valuation",
+                lambda: self._load_peer_valuation(security),
+                "行业估值比较接口暂时不可用",
+                timedelta(hours=24),
+                "AkShare·东方财富行业成分估值",
+            ),
         )
         with ThreadPoolExecutor(max_workers=6) as executor:
             future_map = {}
@@ -1758,6 +1835,58 @@ class DataProvider:
                 except Exception:
                     bundle.warnings.append(warning)
         return bundle
+
+    def _load_peer_valuation(self, security: Security) -> pd.DataFrame:
+        company = pd.DataFrame()
+        if self.historical_store is not None:
+            company, _metadata = self.historical_store.load_dataset_snapshot(
+                security, "company_info"
+            )
+        if company.empty:
+            company = self._load_company_info(security)
+
+        industry = ""
+        if {"item", "value"}.issubset(company.columns):
+            matched = company[
+                company["item"].astype(str).str.contains("行业", na=False)
+            ]
+            if not matched.empty:
+                industry = str(matched.iloc[0]["value"]).strip()
+        if not industry:
+            for column in ("行业", "所属行业", "行业名称"):
+                if column in company and not company.empty:
+                    industry = str(company.iloc[0].get(column, "")).strip()
+                    if industry:
+                        break
+        if not industry:
+            raise RuntimeError("企业概况未提供所属行业")
+
+        frame = self._call_with_timeout(
+            lambda: ak.stock_board_industry_cons_em(symbol=industry), 10
+        )
+        if frame is None or frame.empty:
+            raise RuntimeError("行业成分接口返回空数据")
+
+        def average(*names: str) -> float | None:
+            column = next((name for name in names if name in frame), None)
+            if column is None:
+                return None
+            values = pd.to_numeric(frame[column], errors="coerce")
+            values = values[np.isfinite(values) & (values > 0)]
+            return float(values.mean()) if not values.empty else None
+
+        result = pd.DataFrame(
+            [
+                {
+                    "行业": industry,
+                    "行业平均市盈率": average("市盈率-动态", "动态市盈率", "市盈率"),
+                    "行业平均市净率": average("市净率", "市净率MRQ"),
+                    "样本数": len(frame),
+                }
+            ]
+        )
+        result.attrs["source"] = "AkShare·东方财富行业成分估值"
+        return result
 
     def _load_corporate_actions(self, security: Security) -> pd.DataFrame:
         loaders: list[tuple[str, Callable[[], pd.DataFrame]]]

@@ -20,8 +20,8 @@ APP_STYLESHEET = """
 QWidget {
     background: #07111F;
     color: #DFE8F5;
-    font-family: "Microsoft YaHei UI";
-    font-size: 13px;
+    font-family: "Microsoft YaHei UI", "Segoe UI";
+    font-size: 12px;
 }
 QMainWindow, QStackedWidget { background: #07111F; }
 QFrame#TopBar, QFrame#Section, QFrame#Card {
@@ -45,16 +45,23 @@ QFrame#ChartControls {
     border: 1px solid #2B4260;
     border-radius: 8px;
 }
-QLabel#AppName { font-size: 18px; font-weight: 700; color: #F4F8FD; }
-QLabel#NavigationBrand { font-size: 18px; font-weight: 800; color: #F4F8FD; }
-QLabel#EmptyStateTitle { font-size: 26px; font-weight: 700; color: #DCEAF7; }
-QLabel#PageTitle { font-size: 22px; font-weight: 700; color: #F4F8FD; }
-QLabel#SecurityName { font-size: 24px; font-weight: 700; color: #F4F8FD; }
-QLabel#Price { font-size: 30px; font-weight: 700; }
+QFrame#InfoStrip {
+    background: #091728;
+    border: 1px solid #182A40;
+    border-radius: 8px;
+}
+QLabel#AppName { font-size: 17px; font-weight: 700; color: #F4F8FD; }
+QLabel#NavigationBrand { font-size: 17px; font-weight: 800; color: #F4F8FD; }
+QLabel#EmptyStateTitle { font-size: 24px; font-weight: 700; color: #DCEAF7; }
+QLabel#PageTitle { font-size: 21px; font-weight: 700; color: #F4F8FD; }
+QLabel#SecurityName { font-size: 21px; font-weight: 700; color: #F4F8FD; }
+QLabel#Price { font-size: 27px; font-weight: 700; }
 QLabel#Muted { color: #8496AF; }
-QLabel#Tiny { color: #6F829D; font-size: 11px; }
-QLabel#MetricValue { color: #F4F8FD; font-size: 20px; font-weight: 700; }
-QLabel#MetricTitle { color: #8496AF; font-size: 12px; }
+QLabel#Tiny { color: #7588A2; font-size: 10px; }
+QLabel#MetricValue { color: #F4F8FD; font-size: 18px; font-weight: 700; }
+QLabel#MetricTitle { color: #8496AF; font-size: 11px; }
+QLabel#BasicMetricTitle { color: #71849D; font-size: 10px; }
+QLabel#BasicMetricValue { color: #E4EDF7; font-size: 12px; font-weight: 600; }
 QLineEdit, QTextEdit, QComboBox, QSpinBox {
     background: #0E1C30;
     border: 1px solid #253852;
@@ -67,13 +74,13 @@ QCheckBox { color: #AFC0D5; spacing: 7px; }
 QCheckBox::indicator { width: 16px; height: 16px; }
 QCheckBox::indicator:unchecked { border: 1px solid #3A587C; background: #0E1C30; border-radius: 3px; }
 QCheckBox::indicator:checked { border: 1px solid #38BDF8; background: #0284C7; border-radius: 3px; }
-QLineEdit#SearchBox { font-size: 14px; padding: 10px 14px; }
+QLineEdit#SearchBox { font-size: 13px; padding: 9px 13px; }
 QPushButton {
     background: #12233A;
     color: #DDE7F5;
     border: 1px solid #263B57;
     border-radius: 7px;
-    padding: 8px 14px;
+    padding: 7px 13px;
     font-weight: 600;
 }
 QPushButton:hover { background: #17304E; border-color: #3A587C; }
@@ -90,7 +97,7 @@ QPushButton#MainNavigationButton {
     border-bottom: 2px solid transparent;
     border-radius: 0;
     color: #8194AD;
-    padding: 10px 14px 9px 14px;
+    padding: 9px 13px 8px 13px;
 }
 QPushButton#MainNavigationButton:hover { color: #DCEAF7; background: #0D1D31; }
 QPushButton#MainNavigationButton:checked {
@@ -141,13 +148,13 @@ QTableWidget, QTableView, QListWidget {
     selection-color: #FFFFFF;
     outline: none;
 }
-QTableWidget::item, QTableView::item { padding: 7px 8px; border-bottom: 1px solid #14243A; }
+QTableWidget::item, QTableView::item { padding: 6px 8px; border-bottom: 1px solid #14243A; }
 QHeaderView::section {
     background: #0F1D31;
     color: #8395AE;
     border: 0;
     border-bottom: 1px solid #253852;
-    padding: 9px 8px;
+    padding: 8px 8px;
     font-weight: 600;
 }
 QListWidget::item { padding: 10px; border-bottom: 1px solid #17263A; }
@@ -158,7 +165,7 @@ QTabBar::tab {
     background: transparent;
     color: #7F91AA;
     border: 0;
-    padding: 12px 18px;
+    padding: 10px 16px;
     font-weight: 600;
 }
 QTabBar::tab:selected { color: #E8F3FC; border-bottom: 2px solid #38BDF8; }
@@ -223,8 +230,8 @@ class MetricCard(QFrame):
         self.setObjectName("Card")
         self.setMinimumWidth(145)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(5)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
         self.title_label = QLabel(title)
         self.title_label.setObjectName("MetricTitle")
         self.value_label = QLabel(value)
@@ -275,7 +282,7 @@ def configure_table(table: QTableWidget, alternating: bool = True) -> None:
     table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     table.verticalHeader().setVisible(False)
-    table.verticalHeader().setDefaultSectionSize(48)
+    table.verticalHeader().setDefaultSectionSize(43)
     table.setShowGrid(False)
     table.setSortingEnabled(False)
     table.horizontalHeader().setHighlightSections(False)

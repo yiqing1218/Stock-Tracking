@@ -10,7 +10,7 @@ from .data_provider import MarketDashboardBundle
 from .data_provider import infer_market
 from .historical_store import HistoricalStore
 from .models import Security, SecurityType
-from .time_utils import beijing_now, beijing_today
+from .time_utils import beijing_today
 
 
 @dataclass(frozen=True, slots=True)

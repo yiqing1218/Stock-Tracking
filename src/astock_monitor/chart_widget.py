@@ -35,13 +35,14 @@ COLORS = {
 class MarketChart(QWidget):
     date_activated = Signal(object)
     event_activated = Signal(object)
+    range_selected = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMinimumHeight(430)
+        self.setMinimumHeight(370)
         self._frame = pd.DataFrame()
         self._custom: pd.Series | None = None
         self._custom_name = "MACD"
@@ -55,9 +56,10 @@ class MarketChart(QWidget):
         self._event_markers = pd.DataFrame()
         self._marker_hits: list[tuple[QRectF, dict]] = []
         self._overlay_columns = ["SMA_5", "SMA_20", "BB_UPPER", "BB_LOWER"]
+        self._selected_timestamp: pd.Timestamp | None = None
 
     def sizeHint(self) -> QSize:
-        return QSize(900, 600)
+        return QSize(900, 520)
 
     def set_data(
         self,
@@ -83,6 +85,7 @@ class MarketChart(QWidget):
             event_markers.copy() if event_markers is not None else pd.DataFrame()
         )
         self._marker_hits = []
+        self._selected_timestamp = None
         self._visible_count = min(max(40, self._visible_count), max(40, len(frame)))
         self._right_offset = 0
         self.update()
@@ -94,6 +97,7 @@ class MarketChart(QWidget):
         self._percentage_axis = False
         self._visible_frame = pd.DataFrame()
         self._marker_hits = []
+        self._selected_timestamp = None
         self._right_offset = 0
         self.update()
 
@@ -167,6 +171,46 @@ class MarketChart(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         self.setFocus(Qt.FocusReason.MouseFocusReason)
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self._visible_frame.empty
+            and self._last_plot_rect.contains(event.position())
+        ):
+            spacing = self._last_plot_rect.width() / max(
+                len(self._visible_frame), 1
+            )
+            index = int(
+                np.clip(
+                    (event.position().x() - self._last_plot_rect.left()) / spacing,
+                    0,
+                    len(self._visible_frame) - 1,
+                )
+            )
+            row = self._visible_frame.iloc[index]
+            timestamp = pd.to_datetime(row.get("date"), errors="coerce")
+            if pd.notna(timestamp):
+                self._selected_timestamp = pd.Timestamp(timestamp)
+                end = self._frame.iloc[-1]
+                start_close = float(row.get("close"))
+                end_close = float(end.get("close"))
+                change_pct = (
+                    (end_close / start_close - 1) * 100 if start_close else 0.0
+                )
+                self.range_selected.emit(
+                    {
+                        "start_date": self._selected_timestamp.strftime(
+                            "%Y-%m-%d"
+                        ),
+                        "end_date": pd.Timestamp(end.get("date")).strftime(
+                            "%Y-%m-%d"
+                        ),
+                        "start_close": start_close,
+                        "end_close": end_close,
+                        "change_pct": change_pct,
+                    }
+                )
+                self.update()
+                event.accept()
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
@@ -254,10 +298,50 @@ class MarketChart(QWidget):
         self._draw_grid(painter, indicator_rect, 2, 4)
         self._draw_price_panel(painter, price_rect, visible)
         self._draw_event_markers(painter, price_rect, visible)
+        self._draw_selected_range(painter, price_rect, visible)
         self._draw_volume_panel(painter, volume_rect, visible)
         self._draw_indicator_panel(painter, indicator_rect, visible, custom)
         self._draw_dates(painter, bounds, indicator_rect, visible)
         self._draw_crosshair(painter, bounds, price_rect, visible)
+
+    def _draw_selected_range(
+        self, painter: QPainter, rect: QRectF, frame: pd.DataFrame
+    ) -> None:
+        if self._selected_timestamp is None or frame.empty:
+            return
+        dates = pd.to_datetime(frame["date"], errors="coerce")
+        matches = np.flatnonzero(
+            dates.eq(self._selected_timestamp).fillna(False).to_numpy()
+        )
+        if not len(matches):
+            return
+        index = int(matches[0])
+        spacing = rect.width() / max(len(frame), 1)
+        x = rect.left() + (index + 0.5) * spacing
+        shade = QColor("#38BDF8")
+        shade.setAlpha(18)
+        painter.fillRect(QRectF(x, rect.top(), rect.right() - x, rect.height()), shade)
+        painter.setPen(QPen(QColor("#38BDF8"), 1, Qt.PenStyle.DashLine))
+        painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+        start_close = float(frame.iloc[index]["close"])
+        end_close = float(self._frame.iloc[-1]["close"])
+        change_pct = (end_close / start_close - 1) * 100 if start_close else 0.0
+        text = (
+            f"选中 {self._selected_timestamp:%Y-%m-%d} 至今 "
+            f"{change_pct:+.2f}%  {start_close:.2f} → {end_close:.2f}"
+        )
+        painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.Weight.DemiBold))
+        metrics = painter.fontMetrics()
+        width = metrics.horizontalAdvance(text) + 18
+        tooltip = QRectF(
+            max(rect.left() + 6, rect.right() - width - 6),
+            rect.top() + 6,
+            width,
+            26,
+        )
+        painter.fillRect(tooltip, QColor("#10243B"))
+        painter.setPen(COLORS["text"])
+        painter.drawText(tooltip, Qt.AlignmentFlag.AlignCenter, text)
 
     def _draw_event_markers(
         self, painter: QPainter, rect: QRectF, frame: pd.DataFrame

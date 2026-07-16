@@ -23,7 +23,7 @@ def main() -> int:
     QCoreApplication.setApplicationName("AStockMonitor")
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeMenuBar, True)
     app = QApplication(sys.argv)
-    app.setFont(QFont("Microsoft YaHei UI", 10))
+    app.setFont(QFont("Microsoft YaHei UI", 9))
     app.setStyleSheet(APP_STYLESHEET)
 
     root = project_root()

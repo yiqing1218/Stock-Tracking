@@ -152,7 +152,7 @@ def test_stage_four_each_source_builds_its_own_notification_baseline(tmp_path) -
     assert third.notified == 1
 
 
-def test_stage_five_persists_real_observation_start_and_source(tmp_path) -> None:
+def test_stage_five_persists_daily_breadth_but_not_realtime_boards(tmp_path) -> None:
     store = HistoricalStore(tmp_path / "warehouse.db")
     service = MarketAnalysisService(store)
     bundle = MarketDashboardBundle(
@@ -180,11 +180,18 @@ def test_stage_five_persists_real_observation_start_and_source(tmp_path) -> None
         sources={"breadth": "测试行情", "boards": "东方财富板块"},
     )
     service.persist_dashboard(bundle)
-    industries = service.list_boards("行业")
-    assert len(industries) == 1
-    assert industries[0]["first_date"] == "2026-07-15"
-    assert industries[0]["classification_source"] == "东方财富板块"
-    assert 0 <= industries[0]["chengjian_heat"] <= 100
+    assert service.list_boards("行业") == []
+    with store.connect() as db:
+        breadth = db.execute(
+            "SELECT * FROM market_breadth_daily WHERE trade_date='2026-07-15'"
+        ).fetchone()
+        board_count = db.execute(
+            "SELECT COUNT(*) FROM board_snapshots"
+        ).fetchone()[0]
+    assert breadth is not None
+    assert breadth["up_count"] == 3200
+    assert breadth["source"] == "测试行情"
+    assert board_count == 0
 
 
 def test_market_dashboard_returns_25_gainers_and_losers(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

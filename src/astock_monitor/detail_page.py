@@ -173,6 +173,49 @@ class DetailPage(QWidget):
         header_layout.addWidget(self.refresh_button)
         root.addWidget(header)
 
+        self.basic_metric_labels: dict[str, QLabel] = {}
+        info_strip = QFrame()
+        info_strip.setObjectName("InfoStrip")
+        info_layout = QGridLayout(info_strip)
+        info_layout.setContentsMargins(12, 6, 12, 6)
+        info_layout.setHorizontalSpacing(12)
+        info_layout.setVerticalSpacing(3)
+        basic_metrics = (
+            ("open", "今开"),
+            ("high", "最高"),
+            ("low", "最低"),
+            ("previous_close", "昨收"),
+            ("turnover", "换手率"),
+            ("volume_ratio", "量比"),
+            ("amplitude", "振幅"),
+            ("volume", "成交量"),
+            ("amount", "成交额"),
+            ("pe", "市盈率"),
+            ("industry_pe", "行业平均PE"),
+            ("pb", "市净率"),
+            ("industry_pb", "行业平均PB"),
+            ("market_cap", "总市值"),
+            ("float_market_cap", "流通市值"),
+            ("industry", "所属行业"),
+        )
+        for index, (key, title) in enumerate(basic_metrics):
+            cell = QWidget()
+            cell_layout = QHBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.setSpacing(5)
+            title_label = QLabel(title)
+            title_label.setObjectName("BasicMetricTitle")
+            value_label = QLabel("—")
+            value_label.setObjectName("BasicMetricValue")
+            value_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            cell_layout.addWidget(title_label)
+            cell_layout.addWidget(value_label, 1)
+            info_layout.addWidget(cell, index // 8, index % 8)
+            self.basic_metric_labels[key] = value_label
+        root.addWidget(info_strip)
+
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.overview_tab = self._build_overview_tab()
@@ -411,7 +454,9 @@ class DetailPage(QWidget):
         self.lower_indicator_combo.currentIndexChanged.connect(self._update_charts)
         toolbar.addWidget(self.lower_indicator_combo)
         toolbar.addSpacing(10)
-        tip = QLabel("滚轮或＋/－缩放；←/→或键盘方向键平移；双击K线进入分时")
+        tip = QLabel(
+            "滚轮或＋/－缩放；←/→或键盘方向键平移；单击K线查看至今涨跌，双击进入分时"
+        )
         tip.setObjectName("Tiny")
         toolbar.addWidget(tip)
         toolbar.addStretch(1)
@@ -426,6 +471,7 @@ class DetailPage(QWidget):
         chart_layout.setContentsMargins(0, 0, 0, 0)
         self.market_chart = MarketChart()
         self.market_chart.date_activated.connect(self._open_intraday_for_date)
+        self.market_chart.range_selected.connect(self._show_chart_range_change)
         chart_layout.addWidget(self.market_chart, 0, 0)
         chart_controls = QFrame()
         chart_controls.setObjectName("ChartControls")
@@ -454,8 +500,8 @@ class DetailPage(QWidget):
         splitter.addWidget(chart_container)
         insights = QFrame()
         insights.setObjectName("Section")
-        insights.setMinimumWidth(315)
-        insights.setMaximumWidth(390)
+        insights.setMinimumWidth(360)
+        insights.setMaximumWidth(450)
         insight_layout = QVBoxLayout(insights)
         insight_layout.setContentsMargins(12, 12, 12, 12)
         insight_layout.setSpacing(9)
@@ -510,6 +556,7 @@ class DetailPage(QWidget):
         splitter.addWidget(insights)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
+        splitter.setSizes([930, 410])
         layout.addWidget(splitter, 1)
         return tab
 
@@ -1003,6 +1050,8 @@ class DetailPage(QWidget):
         self.price_label.setText("—")
         self.change_label.setText("—")
         self.latest_ohlc_label.setText("开 —  高 —  低 —  收 —")
+        for label in self.basic_metric_labels.values():
+            label.setText("—")
         self.loading_label.setText("分析框架已就绪；未载入任何非自选证券的数据。")
         self.refresh_button.setEnabled(False)
         self.watchlist_button.setEnabled(False)
@@ -1178,6 +1227,7 @@ class DetailPage(QWidget):
         self._populate_capital()
         self._populate_company()
         self._populate_financial_indicators()
+        self._update_basic_metrics()
         self._update_charts()
 
     def _on_detail_extras_error(self, token: int, message: str) -> None:
@@ -1387,6 +1437,108 @@ class DetailPage(QWidget):
         self.change_label.setStyleSheet(f"color:{color};")
         self.latest_ohlc_label.setText(
             f"开 {last['open']:.2f}  高 {last['high']:.2f}  低 {last['low']:.2f}  收 {last['close']:.2f}  量 {format_number(last['volume'])}"
+        )
+        self._update_basic_metrics()
+
+    def _update_basic_metrics(self) -> None:
+        if self.bundle is None or self.indicator_frame.empty:
+            return
+        quote = self.bundle.quote
+        row = self.indicator_frame.iloc[-1]
+
+        def quote_or_row(attribute: str, column: str) -> float | None:
+            value = getattr(quote, attribute, None) if quote is not None else None
+            return value if value is not None else self._number(row.get(column))
+
+        values = {
+            "open": format_number(quote_or_row("open", "open")),
+            "high": format_number(quote_or_row("high", "high")),
+            "low": format_number(quote_or_row("low", "low")),
+            "previous_close": format_number(
+                getattr(quote, "previous_close", None)
+                if quote is not None
+                else (
+                    self._number(self.indicator_frame.iloc[-2].get("close"))
+                    if len(self.indicator_frame) > 1
+                    else None
+                )
+            ),
+            "turnover": format_percent(
+                quote_or_row("turnover", "turnover"), signed=False
+            ),
+            "volume_ratio": format_number(
+                getattr(quote, "volume_ratio", None) if quote is not None else None
+            ),
+            "amplitude": format_percent(
+                quote_or_row("amplitude", "amplitude"), signed=False
+            ),
+            "volume": format_number(
+                getattr(quote, "volume", None)
+                if quote is not None
+                else self._number(row.get("volume"))
+            ),
+            "amount": format_number(
+                getattr(quote, "amount", None)
+                if quote is not None
+                else self._number(row.get("amount"))
+            ),
+            "pe": format_number(getattr(quote, "pe", None) if quote is not None else None),
+            "pb": format_number(getattr(quote, "pb", None) if quote is not None else None),
+            "market_cap": format_number(
+                getattr(quote, "market_cap", None) if quote is not None else None
+            ),
+            "float_market_cap": format_number(
+                getattr(quote, "float_market_cap", None)
+                if quote is not None
+                else None
+            ),
+            "industry_pe": "—",
+            "industry_pb": "—",
+            "industry": "—",
+        }
+        peer = self.bundle.peer_valuation
+        if peer is not None and not peer.empty:
+            peer_row = peer.iloc[0]
+            values["industry_pe"] = format_number(
+                self._number(peer_row.get("行业平均市盈率"))
+            )
+            values["industry_pb"] = format_number(
+                self._number(peer_row.get("行业平均市净率"))
+            )
+            values["industry"] = str(peer_row.get("行业", "") or "—")
+        if values["industry"] == "—":
+            values["industry"] = self._company_field(
+                self.bundle.company_info, ("行业", "所属行业", "行业名称")
+            )
+        for key, value in values.items():
+            label = self.basic_metric_labels.get(key)
+            if label is not None:
+                label.setText(value)
+
+    @staticmethod
+    def _company_field(frame: pd.DataFrame, names: tuple[str, ...]) -> str:
+        if frame is None or frame.empty:
+            return "—"
+        if {"item", "value"}.issubset(frame.columns):
+            for _, row in frame.iterrows():
+                item = str(row.get("item", ""))
+                if any(name in item for name in names):
+                    return str(row.get("value", "") or "—")
+        for name in names:
+            if name in frame:
+                value = str(frame.iloc[0].get(name, "") or "")
+                if value:
+                    return value
+        return "—"
+
+    def _show_chart_range_change(self, value: object) -> None:
+        if not isinstance(value, dict):
+            return
+        self.latest_ohlc_label.setText(
+            f"{value.get('start_date', '—')} 至 {value.get('end_date', '—')} · "
+            f"区间涨跌 {float(value.get('change_pct', 0)):+.2f}% · "
+            f"{format_number(self._number(value.get('start_close')))} → "
+            f"{format_number(self._number(value.get('end_close')))}"
         )
 
     def _select_chart_period(self, period: str) -> None:

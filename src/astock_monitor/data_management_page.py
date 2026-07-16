@@ -87,6 +87,8 @@ class DataManagementPage(QWidget):
         self.chip_card = MetricCard("筹码记录")
         self.dataset_card = MetricCard("F10/财务数据集")
         self.breadth_card = MetricCard("市场宽度日记录")
+        self.backtest_card = MetricCard("回测运行")
+        self.backtest_trade_card = MetricCard("回测交易记录")
         self.range_card = MetricCard("日线数据区间")
         self.size_card = MetricCard("数据库大小")
         for index, card in enumerate(
@@ -99,11 +101,13 @@ class DataManagementPage(QWidget):
                 self.chip_card,
                 self.dataset_card,
                 self.breadth_card,
+                self.backtest_card,
+                self.backtest_trade_card,
                 self.range_card,
                 self.size_card,
             )
         ):
-            cards.addWidget(card, index // 5, index % 5)
+            cards.addWidget(card, index // 4, index % 4)
         layout.addLayout(cards)
         note = QLabel(
             "长期保存：完成交易日K线、历史1分钟分时、每日评分、资金、公开筹码、F10/财务及市场宽度。"
@@ -145,11 +149,13 @@ class DataManagementPage(QWidget):
         self.adjustment.addItem("后复权", "hfq")
         self.mode = QComboBox()
         self.mode.addItem("只下载缺少和新增日期", "incremental")
-        self.mode.addItem("完整补齐历史", "full")
+        self.mode.addItem("上市至今完整下载", "full")
         self.mode.addItem("重新下载异常证券", "repair")
         self.sync_button = QPushButton("开始下载到本地数据库")
         self.sync_button.setObjectName("Primary")
         self.sync_button.clicked.connect(self._start_sync)
+        self.full_history_button = QPushButton("准备条件荐股：全部A股上市至今")
+        self.full_history_button.clicked.connect(self._start_full_stock_history)
         self.cancel_button = QPushButton("取消")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel_sync)
@@ -161,6 +167,7 @@ class DataManagementPage(QWidget):
             form.addWidget(QLabel(label))
             form.addWidget(widget)
         form.addStretch(1)
+        form.addWidget(self.full_history_button)
         form.addWidget(self.cancel_button)
         form.addWidget(self.sync_button)
         layout.addWidget(panel)
@@ -202,6 +209,11 @@ class DataManagementPage(QWidget):
             ("资金信息", "fund_flow"),
             ("公开筹码信息", "chips"),
             ("市场宽度日记录", "market_breadth"),
+            ("回测运行摘要", "backtest_runs"),
+            ("回测全部交易", "backtest_trades"),
+            ("回测净值曲线", "backtest_equity"),
+            ("回测持仓快照", "backtest_positions"),
+            ("回测评价指标", "backtest_metrics"),
         ):
             self.export_content.addItem(label, value)
         self.export_adjustment = QComboBox()
@@ -327,7 +339,10 @@ class DataManagementPage(QWidget):
             ("市场宽度日记录", "market_breadth"),
         ):
             self.cleanup_category.addItem(label, value)
-        self.cleanup_before = QDateEdit(QDate.currentDate().addYears(-1))
+        today = beijing_today()
+        self.cleanup_before = QDateEdit(
+            QDate(today.year, today.month, today.day).addYears(-1)
+        )
         self.cleanup_before.setCalendarPopup(True)
         self.cleanup_before.setDisplayFormat("yyyy-MM-dd")
         clear_data = QPushButton("删除所选日期之前的数据")
@@ -347,6 +362,18 @@ class DataManagementPage(QWidget):
         cleanup.addWidget(clear_tasks)
         cleanup.addWidget(optimize)
         layout.addWidget(cleanup_panel)
+        backtest_panel = QFrame()
+        backtest_panel.setObjectName("Section")
+        backtest_layout = QHBoxLayout(backtest_panel)
+        self.backtest_run_combo = QComboBox()
+        self.backtest_run_combo.setMinimumWidth(360)
+        delete_backtest = QPushButton("删除所选回测及其明细")
+        delete_backtest.setObjectName("Danger")
+        delete_backtest.clicked.connect(self._delete_backtest_run)
+        backtest_layout.addWidget(QLabel("回测数据"))
+        backtest_layout.addWidget(self.backtest_run_combo, 1)
+        backtest_layout.addWidget(delete_backtest)
+        layout.addWidget(backtest_panel)
         row = QHBoxLayout()
         check = QPushButton("检查本地日线质量")
         check.clicked.connect(self._validate)
@@ -386,6 +413,14 @@ class DataManagementPage(QWidget):
         self.breadth_card.set_value(
             f"{int(inventory['market_breadth']):,}", "每天覆盖更新一条"
         )
+        self.backtest_card.set_value(
+            f"{int(inventory['backtest_runs']):,}",
+            f"净值点 {int(inventory['backtest_equity']):,}",
+        )
+        self.backtest_trade_card.set_value(
+            f"{int(inventory['backtest_trades']):,}",
+            f"持仓快照 {int(inventory['backtest_positions']):,}",
+        )
         self.range_card.set_value(
             f"{summary.first_date or '—'}\n{summary.last_date or '—'}", "最早 / 最新"
         )
@@ -409,6 +444,18 @@ class DataManagementPage(QWidget):
             ]
             for c, value in enumerate(values):
                 self.jobs_table.setItem(r, c, QTableWidgetItem(str(value)))
+        current_run = self.backtest_run_combo.currentData()
+        self.backtest_run_combo.clear()
+        for run in self.store.list_backtest_runs():
+            label = (
+                f"#{run['id']} {run['name']} · {run['status']} · "
+                f"交易 {run['trade_count']} · {run['started_at']}"
+            )
+            self.backtest_run_combo.addItem(label, int(run["id"]))
+        if current_run is not None:
+            index = self.backtest_run_combo.findData(current_run)
+            if index >= 0:
+                self.backtest_run_combo.setCurrentIndex(index)
 
     def _start_sync(self) -> None:
         if self._worker is not None:
@@ -416,6 +463,7 @@ class DataManagementPage(QWidget):
         scope = str(self.scope.currentData())
         securities = self.repository.list_watchlist() if scope == "watchlist" else None
         self.sync_button.setEnabled(False)
+        self.full_history_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress.setValue(0)
         self._worker = Worker(
@@ -424,7 +472,7 @@ class DataManagementPage(QWidget):
             securities,
             str(self.adjustment.currentData()),
             str(self.mode.currentData()),
-            16000,
+            20000,
             self.sync_progress.emit,
         )
         self._worker.signals.result.connect(self._sync_finished)
@@ -433,6 +481,12 @@ class DataManagementPage(QWidget):
         )
         self._worker.signals.finished.connect(self._finish_worker)
         self.thread_pool.start(self._worker)
+
+    def _start_full_stock_history(self) -> None:
+        self.scope.setCurrentIndex(max(0, self.scope.findData("stocks")))
+        self.adjustment.setCurrentIndex(max(0, self.adjustment.findData("qfq")))
+        self.mode.setCurrentIndex(max(0, self.mode.findData("full")))
+        self._start_sync()
 
     def _progress(self, value: SyncProgress) -> None:
         self._job_id = value.job_id
@@ -453,6 +507,7 @@ class DataManagementPage(QWidget):
     def _finish_worker(self) -> None:
         self._worker = None
         self.sync_button.setEnabled(True)
+        self.full_history_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
 
     def _cancel_sync(self) -> None:
@@ -598,3 +653,23 @@ class DataManagementPage(QWidget):
             lambda message: self.storage_status.setText(f"数据库整理失败：{message}")
         )
         self.thread_pool.start(worker)
+
+    def _delete_backtest_run(self) -> None:
+        run_id = self.backtest_run_combo.currentData()
+        if run_id is None:
+            self.storage_status.setText("当前没有可删除的回测运行。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认删除回测",
+            f"确认删除回测运行 #{int(run_id)} 及其交易、净值、持仓和指标明细？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        count = self.store.delete_backtest_run(int(run_id))
+        self.storage_status.setText(
+            "已删除所选回测运行及全部关联明细。"
+            if count
+            else "所选回测运行已不存在。"
+        )
+        self.refresh()

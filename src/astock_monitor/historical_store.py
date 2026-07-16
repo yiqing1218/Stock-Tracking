@@ -425,6 +425,8 @@ class HistoricalStore:
                     started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     finished_at TEXT NOT NULL DEFAULT ''
                 );
+                CREATE INDEX IF NOT EXISTS idx_backtest_runs_started
+                    ON backtest_runs(started_at DESC,status);
                 CREATE TABLE IF NOT EXISTS backtest_trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id INTEGER NOT NULL REFERENCES backtest_runs(id) ON DELETE CASCADE,
@@ -444,6 +446,8 @@ class HistoricalStore:
                     benchmark_equity REAL, drawdown REAL, exposure REAL,
                     PRIMARY KEY(run_id, trade_date)
                 );
+                CREATE INDEX IF NOT EXISTS idx_backtest_equity_date
+                    ON backtest_equity(trade_date,run_id);
                 CREATE TABLE IF NOT EXISTS backtest_positions (
                     run_id INTEGER NOT NULL REFERENCES backtest_runs(id) ON DELETE CASCADE,
                     trade_date TEXT NOT NULL, security_id INTEGER NOT NULL REFERENCES securities(id) ON DELETE CASCADE,
@@ -944,6 +948,50 @@ class HistoricalStore:
                     params.append(end)
                 sql += " ORDER BY trade_date"
                 cursor = db.execute(sql, params)
+                writer = csv.writer(handle)
+                writer.writerow([item[0] for item in cursor.description])
+                while True:
+                    rows = cursor.fetchmany(2000)
+                    if not rows:
+                        break
+                    writer.writerows([tuple(row) for row in rows])
+                    count += len(rows)
+            return count
+
+        backtest_tables = {
+            "backtest_runs": (
+                "backtest_runs",
+                "SELECT * FROM backtest_runs ORDER BY id",
+            ),
+            "backtest_trades": (
+                "backtest_trades",
+                """SELECT t.*,s.code,s.name,s.market,s.security_type
+                FROM backtest_trades t
+                LEFT JOIN securities s ON s.id=t.security_id
+                ORDER BY t.run_id,t.trade_date,t.id""",
+            ),
+            "backtest_equity": (
+                "backtest_equity",
+                "SELECT * FROM backtest_equity ORDER BY run_id,trade_date",
+            ),
+            "backtest_positions": (
+                "backtest_positions",
+                """SELECT p.*,s.code,s.name,s.market,s.security_type
+                FROM backtest_positions p
+                JOIN securities s ON s.id=p.security_id
+                ORDER BY p.run_id,p.trade_date,s.code""",
+            ),
+            "backtest_metrics": (
+                "backtest_metrics",
+                "SELECT * FROM backtest_metrics ORDER BY run_id,metric_key",
+            ),
+        }
+        if dataset in backtest_tables:
+            _table, sql = backtest_tables[dataset]
+            with self.connect() as db, output.open(
+                "w", newline="", encoding="utf-8-sig"
+            ) as handle:
+                cursor = db.execute(sql)
                 writer = csv.writer(handle)
                 writer.writerow([item[0] for item in cursor.description])
                 while True:
@@ -1485,8 +1533,16 @@ class HistoricalStore:
                  last_success_at,retry_after,last_error,record_count,source)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(security_id,data_kind,data_key) DO UPDATE SET
-                coverage_start=CASE WHEN excluded.coverage_start='' THEN data_fetch_state.coverage_start ELSE excluded.coverage_start END,
-                coverage_end=CASE WHEN excluded.coverage_end='' THEN data_fetch_state.coverage_end ELSE excluded.coverage_end END,
+                coverage_start=CASE
+                    WHEN excluded.coverage_start='' THEN data_fetch_state.coverage_start
+                    WHEN data_fetch_state.coverage_start='' THEN excluded.coverage_start
+                    WHEN excluded.coverage_start<data_fetch_state.coverage_start THEN excluded.coverage_start
+                    ELSE data_fetch_state.coverage_start END,
+                coverage_end=CASE
+                    WHEN excluded.coverage_end='' THEN data_fetch_state.coverage_end
+                    WHEN data_fetch_state.coverage_end='' THEN excluded.coverage_end
+                    WHEN excluded.coverage_end>data_fetch_state.coverage_end THEN excluded.coverage_end
+                    ELSE data_fetch_state.coverage_end END,
                 last_attempt_at=excluded.last_attempt_at,
                 last_success_at=CASE WHEN excluded.last_success_at='' THEN data_fetch_state.last_success_at ELSE excluded.last_success_at END,
                 retry_after=excluded.retry_after,last_error=excluded.last_error,
@@ -1574,6 +1630,11 @@ class HistoricalStore:
             "datasets": "security_dataset_snapshots",
             "market_breadth": "market_breadth_daily",
             "company_events": "company_events",
+            "backtest_runs": "backtest_runs",
+            "backtest_trades": "backtest_trades",
+            "backtest_equity": "backtest_equity",
+            "backtest_positions": "backtest_positions",
+            "backtest_metrics": "backtest_metrics",
         }
         result: dict[str, object] = {}
         with self.connect() as db:
@@ -1597,6 +1658,27 @@ class HistoricalStore:
             self.database_path.stat().st_size if self.database_path.exists() else 0
         )
         return result
+
+    def list_backtest_runs(self, limit: int = 200) -> list[dict[str, object]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT r.id,r.name,r.status,r.progress,r.started_at,r.finished_at,
+                r.data_version,r.code_version,r.error_count,
+                (SELECT COUNT(*) FROM backtest_trades t WHERE t.run_id=r.id) trade_count,
+                (SELECT COUNT(*) FROM backtest_equity e WHERE e.run_id=r.id) equity_count
+                FROM backtest_runs r ORDER BY r.id DESC LIMIT ?""",
+                (max(1, min(limit, 5000)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_backtest_run(self, run_id: int) -> int:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT COUNT(*) FROM backtest_runs WHERE id=?", (int(run_id),)
+            ).fetchone()
+            count = int(row[0] or 0)
+            db.execute("DELETE FROM backtest_runs WHERE id=?", (int(run_id),))
+        return count
 
     def clear_rebuildable_data(self, category: str, before_date: str) -> int:
         """Delete only explicitly re-downloadable data; protected tables are unreachable."""
