@@ -82,7 +82,7 @@ class SyncService:
                         calendar_days=days,
                         use_cache=attempt == 0,
                         adjustment=adjustment,
-                        include_live=True,
+                        include_live=False,
                         persist=True,
                     )
                     if last and mode == "incremental":
@@ -125,8 +125,7 @@ class SyncService:
                             frame,
                             adjustment,
                             source,
-                            temporary_last=pd.Timestamp(frame.iloc[-1]["date"]).date()
-                            == beijing_today(),
+                            temporary_last=False,
                         )
                     except Exception as exc:
                         failed += 1

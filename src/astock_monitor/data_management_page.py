@@ -34,7 +34,7 @@ from .ui_common import MetricCard, Worker, configure_table, format_number, secti
 
 
 class DataManagementPage(QWidget):
-    """Phase-one warehouse management and data export without blocking the UI."""
+    """Explain and manage durable data, downloads, storage and exports."""
 
     warehouse_changed = Signal()
     sync_progress = Signal(object)
@@ -63,14 +63,17 @@ class DataManagementPage(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 14, 18, 14)
         root.addWidget(
-            section_title("数据导出", "本地历史仓库 · 增量同步 · 质量检查 · CSV导出")
+            section_title(
+                "数据中心",
+                "本地数据库概况 · 历史数据下载 · 安全存储管理 · 从数据库导出",
+            )
         )
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, 1)
-        self.tabs.addTab(self._overview(), "仓库概况")
-        self.tabs.addTab(self._sync(), "数据同步")
+        self.tabs.addTab(self._overview(), "本地数据概况")
+        self.tabs.addTab(self._sync(), "历史数据下载")
+        self.tabs.addTab(self._quality(), "存储管理")
         self.tabs.addTab(self._export(), "数据导出")
-        self.tabs.addTab(self._quality(), "质量与任务")
 
     def _overview(self) -> QWidget:
         page = QWidget()
@@ -78,15 +81,33 @@ class DataManagementPage(QWidget):
         cards = QGridLayout()
         self.security_card = MetricCard("证券数量")
         self.bar_card = MetricCard("日线记录")
-        self.range_card = MetricCard("数据区间")
+        self.intraday_card = MetricCard("一分钟分时")
+        self.score_card = MetricCard("每日评分")
+        self.fund_card = MetricCard("资金记录")
+        self.chip_card = MetricCard("筹码记录")
+        self.dataset_card = MetricCard("F10/财务数据集")
+        self.breadth_card = MetricCard("市场宽度日记录")
+        self.range_card = MetricCard("日线数据区间")
         self.size_card = MetricCard("数据库大小")
         for index, card in enumerate(
-            (self.security_card, self.bar_card, self.range_card, self.size_card)
+            (
+                self.security_card,
+                self.bar_card,
+                self.intraday_card,
+                self.score_card,
+                self.fund_card,
+                self.chip_card,
+                self.dataset_card,
+                self.breadth_card,
+                self.range_card,
+                self.size_card,
+            )
         ):
-            cards.addWidget(card, index // 2, index % 2)
+            cards.addWidget(card, index // 5, index % 5)
         layout.addLayout(cards)
         note = QLabel(
-            "本地仓库与原自选、指标、消息表共用 SQLite 文件，但使用独立表和增量迁移；网络失败不会删除已有数据。"
+            "长期保存：完成交易日K线、历史1分钟分时、每日评分、资金、公开筹码、F10/财务及市场宽度。"
+            "只临时展示：大盘实时指数、板块榜、涨跌榜、当日未收盘K线、当日分时和涨跌原因。"
         )
         note.setWordWrap(True)
         note.setObjectName("Muted")
@@ -94,7 +115,7 @@ class DataManagementPage(QWidget):
         actions = QHBoxLayout()
         refresh = QPushButton("刷新概况")
         refresh.clicked.connect(self.refresh)
-        import_button = QPushButton("导入旧版CSV缓存")
+        import_button = QPushButton("迁移旧版日线CSV到数据库")
         import_button.clicked.connect(self._import_cache)
         actions.addWidget(refresh)
         actions.addWidget(import_button)
@@ -123,10 +144,10 @@ class DataManagementPage(QWidget):
         self.adjustment.addItem("不复权", "")
         self.adjustment.addItem("后复权", "hfq")
         self.mode = QComboBox()
-        self.mode.addItem("增量同步", "incremental")
-        self.mode.addItem("完整补齐", "full")
-        self.mode.addItem("修复重拉", "repair")
-        self.sync_button = QPushButton("开始同步")
+        self.mode.addItem("只下载缺少和新增日期", "incremental")
+        self.mode.addItem("完整补齐历史", "full")
+        self.mode.addItem("重新下载异常证券", "repair")
+        self.sync_button = QPushButton("开始下载到本地数据库")
         self.sync_button.setObjectName("Primary")
         self.sync_button.clicked.connect(self._start_sync)
         self.cancel_button = QPushButton("取消")
@@ -146,9 +167,17 @@ class DataManagementPage(QWidget):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         layout.addWidget(self.progress)
-        self.sync_status = QLabel("建议先同步当前自选验证，再按磁盘空间同步全市场。")
+        self.sync_status = QLabel(
+            "条件荐股只读取本地前复权日线。要保证随时可用，请下载“全部A股 + 前复权”；"
+            "再次执行增量下载只补缺失日期，不重复下载已有历史。"
+        )
         self.sync_status.setObjectName("Muted")
+        self.sync_status.setWordWrap(True)
         layout.addWidget(self.sync_status)
+        self.startup_prefetch_status = QLabel("启动近5日分时下载尚未执行。")
+        self.startup_prefetch_status.setObjectName("Tiny")
+        self.startup_prefetch_status.setWordWrap(True)
+        layout.addWidget(self.startup_prefetch_status)
         layout.addStretch(1)
         return page
 
@@ -165,19 +194,31 @@ class DataManagementPage(QWidget):
         self.export_scope.addItem("全部本地A股", "stocks")
         self.export_scope.addItem("全部本地ETF", "etfs")
         self.export_scope.addItem("当前自选", "watchlist")
+        self.export_content = QComboBox()
+        for label, value in (
+            ("日K线", "daily_bars"),
+            ("历史1分钟分时", "intraday_bars"),
+            ("每日综合评分", "daily_scores"),
+            ("资金信息", "fund_flow"),
+            ("公开筹码信息", "chips"),
+            ("市场宽度日记录", "market_breadth"),
+        ):
+            self.export_content.addItem(label, value)
         self.export_adjustment = QComboBox()
         self.export_adjustment.addItem("前复权", "qfq")
         self.export_adjustment.addItem("不复权", "")
         self.export_adjustment.addItem("后复权", "hfq")
         self.export_format = QComboBox()
         self.export_format.addItem("CSV 长表（UTF-8 BOM，Excel可直接打开）", "csv")
-        scope_layout.addWidget(scope_title, 0, 0, 1, 6)
-        scope_layout.addWidget(QLabel("证券范围"), 1, 0)
-        scope_layout.addWidget(self.export_scope, 1, 1)
-        scope_layout.addWidget(QLabel("价格口径"), 1, 2)
-        scope_layout.addWidget(self.export_adjustment, 1, 3)
-        scope_layout.addWidget(QLabel("文件格式"), 1, 4)
-        scope_layout.addWidget(self.export_format, 1, 5)
+        scope_layout.addWidget(scope_title, 0, 0, 1, 8)
+        scope_layout.addWidget(QLabel("导出内容"), 1, 0)
+        scope_layout.addWidget(self.export_content, 1, 1)
+        scope_layout.addWidget(QLabel("证券范围"), 1, 2)
+        scope_layout.addWidget(self.export_scope, 1, 3)
+        scope_layout.addWidget(QLabel("价格口径（日K）"), 1, 4)
+        scope_layout.addWidget(self.export_adjustment, 1, 5)
+        scope_layout.addWidget(QLabel("文件格式"), 1, 6)
+        scope_layout.addWidget(self.export_format, 1, 7)
         layout.addWidget(scope_panel)
 
         date_panel = QFrame()
@@ -231,13 +272,14 @@ class DataManagementPage(QWidget):
         self.export_progress.hide()
         layout.addWidget(self.export_progress)
         self.export_status = QLabel(
-            "采用证券逐批读取与写入，不构建全市场内存宽表；输出包含代码、名称、类型、市场、交易日、复权口径和全部日线字段。"
+            "导出只读取 SQLite 本地数据库，不读取或打包桌面应用缓存；"
+            "采用分批流式写入，不把全市场数据一次性放进内存。"
         )
         self.export_status.setObjectName("Muted")
         self.export_status.setWordWrap(True)
         layout.addWidget(self.export_status)
         tip = QLabel(
-            "建议：先在“数据同步”确认所需复权口径和日期已入库，再导出；导出过程只读数据库，不会修改或删除现有数据。"
+            "建议：先在“历史数据下载”确认所需数据已经入库。导出过程只读，不会修改数据库。"
         )
         tip.setObjectName("Tiny")
         tip.setWordWrap(True)
@@ -266,12 +308,57 @@ class DataManagementPage(QWidget):
     def _quality(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        protected = QLabel(
+            "受保护、不可在本页删除：自选股与分组、自定义指标、提醒规则与消息、公司事件、证券目录、"
+            "条件荐股定义，以及支撑条件荐股的日K主仓库。下方只能清理可重新下载的数据。"
+        )
+        protected.setObjectName("Muted")
+        protected.setWordWrap(True)
+        layout.addWidget(protected)
+        cleanup_panel = QFrame()
+        cleanup_panel.setObjectName("Section")
+        cleanup = QHBoxLayout(cleanup_panel)
+        self.cleanup_category = QComboBox()
+        for label, value in (
+            ("历史1分钟分时", "intraday"),
+            ("每日评分", "scores"),
+            ("资金记录", "fund_flow"),
+            ("筹码记录", "chips"),
+            ("市场宽度日记录", "market_breadth"),
+        ):
+            self.cleanup_category.addItem(label, value)
+        self.cleanup_before = QDateEdit(QDate.currentDate().addYears(-1))
+        self.cleanup_before.setCalendarPopup(True)
+        self.cleanup_before.setDisplayFormat("yyyy-MM-dd")
+        clear_data = QPushButton("删除所选日期之前的数据")
+        clear_data.clicked.connect(self._clear_selected_data)
+        clear_cache = QPushButton("清理临时文件缓存")
+        clear_cache.clicked.connect(self._clear_transient_cache)
+        clear_tasks = QPushButton("清理已完成任务记录")
+        clear_tasks.clicked.connect(self._clear_task_history)
+        optimize = QPushButton("整理并压缩数据库")
+        optimize.clicked.connect(self._optimize_database)
+        cleanup.addWidget(QLabel("可重建数据"))
+        cleanup.addWidget(self.cleanup_category)
+        cleanup.addWidget(QLabel("早于"))
+        cleanup.addWidget(self.cleanup_before)
+        cleanup.addWidget(clear_data)
+        cleanup.addWidget(clear_cache)
+        cleanup.addWidget(clear_tasks)
+        cleanup.addWidget(optimize)
+        layout.addWidget(cleanup_panel)
         row = QHBoxLayout()
-        check = QPushButton("运行质量检查")
+        check = QPushButton("检查本地日线质量")
         check.clicked.connect(self._validate)
         row.addWidget(check)
         row.addStretch(1)
         layout.addLayout(row)
+        self.storage_status = QLabel(
+            "删除操作不会触及受保护表；临时缓存和本地数据库是两套独立存储。"
+        )
+        self.storage_status.setObjectName("Tiny")
+        self.storage_status.setWordWrap(True)
+        layout.addWidget(self.storage_status)
         self.jobs_table = QTableWidget(0, 8)
         self.jobs_table.setHorizontalHeaderLabels(
             ["任务", "范围", "模式", "状态", "进度", "失败", "开始", "结束"]
@@ -285,8 +372,20 @@ class DataManagementPage(QWidget):
 
     def refresh(self) -> None:
         summary = self.store.summary()
+        inventory = self.store.inventory()
         self.security_card.set_value(f"{summary.securities:,}", "已登记")
         self.bar_card.set_value(f"{summary.bars:,}", "本地日K")
+        self.intraday_card.set_value(
+            f"{int(inventory['intraday_bars']):,}",
+            f"{int(inventory['intraday_securities']):,} 只证券",
+        )
+        self.score_card.set_value(f"{int(inventory['daily_scores']):,}", "证券交易日")
+        self.fund_card.set_value(f"{int(inventory['fund_flow']):,}", "公开值与标明的估算值")
+        self.chip_card.set_value(f"{int(inventory['chips']):,}", "不编造缺失筹码")
+        self.dataset_card.set_value(f"{int(inventory['datasets']):,}", "本地数据集")
+        self.breadth_card.set_value(
+            f"{int(inventory['market_breadth']):,}", "每天覆盖更新一条"
+        )
         self.range_card.set_value(
             f"{summary.first_date or '—'}\n{summary.last_date or '—'}", "最早 / 最新"
         )
@@ -397,7 +496,8 @@ class DataManagementPage(QWidget):
         self.export_progress.show()
         self.export_status.setText("正在按证券流式导出，请勿关闭程序……")
         self._export_worker = Worker(
-            self.store.export_csv,
+            self.store.export_dataset_csv,
+            str(self.export_content.currentData()),
             Path(path),
             securities,
             str(self.export_adjustment.currentData()),
@@ -432,5 +532,69 @@ class DataManagementPage(QWidget):
         )
         worker.signals.error.connect(
             lambda message: QMessageBox.warning(self, "检查失败", message)
+        )
+        self.thread_pool.start(worker)
+
+    def set_startup_prefetch_status(self, message: str) -> None:
+        self.startup_prefetch_status.setText(message)
+        self.refresh()
+
+    def _clear_selected_data(self) -> None:
+        category = str(self.cleanup_category.currentData())
+        before = self.cleanup_before.date().toString("yyyy-MM-dd")
+        answer = QMessageBox.question(
+            self,
+            "确认删除可重建数据",
+            f"确认删除“{self.cleanup_category.currentText()}”中早于 {before} 的记录？\n"
+            "这些数据以后需要时必须重新下载。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            count = self.store.clear_rebuildable_data(category, before)
+            self.storage_status.setText(f"已删除 {count:,} 条可重建记录。")
+            self.refresh()
+            self.warehouse_changed.emit()
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+
+    def _clear_transient_cache(self) -> None:
+        patterns = (
+            "intraday_*.csv",
+            "market_*.csv",
+            "market_*.source.txt",
+            "alert_market_snapshot_*.csv",
+            "alert_market_snapshot_*.source.txt",
+            "news_v3_*.json",
+        )
+        removed = 0
+        for pattern in patterns:
+            for path in self.provider.cache_dir.glob(pattern):
+                try:
+                    if path.is_file():
+                        path.unlink()
+                        removed += 1
+                except OSError:
+                    continue
+        self.storage_status.setText(
+            f"已清理 {removed} 个临时缓存文件；本地数据库未改变。"
+        )
+
+    def _clear_task_history(self) -> None:
+        count = self.store.clear_task_history()
+        self.storage_status.setText(f"已清理 {count} 条下载任务记录。")
+        self.refresh()
+
+    def _optimize_database(self) -> None:
+        self.storage_status.setText("正在整理数据库空闲页并更新查询统计…")
+        worker = Worker(self.store.optimize)
+        worker.signals.result.connect(
+            lambda _value: (
+                self.storage_status.setText("数据库整理完成。"),
+                self.refresh(),
+            )
+        )
+        worker.signals.error.connect(
+            lambda message: self.storage_status.setText(f"数据库整理失败：{message}")
         )
         self.thread_pool.start(worker)

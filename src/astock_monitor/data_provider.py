@@ -20,7 +20,13 @@ import pandas as pd
 import requests
 
 from .models import NewsArticle, Quote, Security, SecurityType
-from .time_utils import beijing_now, beijing_today, cache_age_seconds
+from .historical_store import HistoricalStore
+from .time_utils import (
+    beijing_now,
+    beijing_today,
+    cache_age_seconds,
+    latest_completed_market_day,
+)
 
 
 COMMON_INDICES = [
@@ -143,6 +149,12 @@ class DataProvider:
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.history_sources: dict[str, str] = {}
+        self.historical_store: HistoricalStore | None = None
+
+    def attach_store(self, store: HistoricalStore) -> None:
+        """Use SQLite as the durable source of truth; files remain short-lived fallback."""
+
+        self.historical_store = store
 
     def load_universe(self, force: bool = False) -> list[Security]:
         cache_path = self.cache_dir / "security_universe.json"
@@ -790,36 +802,69 @@ class DataProvider:
     def refresh_scores(self, securities: list[Security]) -> dict[str, float]:
         """Calculate the same six-dimension score used by the detail page."""
 
-        from .indicators import calculate_indicators, market_regime
+        from .indicators import (
+            build_indicator_snapshot,
+            calculate_indicators,
+            dimension_composites,
+            market_regime,
+        )
 
         def calculate(security: Security) -> tuple[str, float]:
+            target_date = latest_completed_market_day()
+            store = self.historical_store
+            if store is not None:
+                saved = store.daily_score(security, target_date)
+                if saved is not None:
+                    return security.key, float(saved["score"])
             path = self.cache_dir / (
                 f"score_v3_{security.security_type.value}_{security.code}.json"
             )
-            if self._cache_is_fresh(path, timedelta(minutes=10)):
+            if store is None and self._cache_is_fresh(path, timedelta(minutes=10)):
                 try:
                     value = json.loads(path.read_text(encoding="utf-8"))
                     return security.key, float(value["score"])
                 except (OSError, TypeError, ValueError, KeyError):
                     pass
             history = self.get_history(
-                security, use_cache=True, adjustment="qfq", include_live=True
+                security, use_cache=True, adjustment="qfq", include_live=False
             )
             # 首页评分与详情页首屏采用同一组经典系统指标；扩展指标库
             # 在用户打开“全部指标”时按需计算，避免监看页为每只股票
             # 同时展开数百列而占用大量内存。
             frame = calculate_indicators(history, include_extended=False)
-            score = float(market_regime(frame)["score"])
-            path.write_text(
-                json.dumps(
-                    {
-                        "score": score,
-                        "beijing_time": beijing_today().isoformat(),
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
+            regime = market_regime(frame)
+            score = float(regime["score"])
+            score_date = pd.Timestamp(frame.iloc[-1]["date"]).date()
+            if store is not None:
+                composites = dimension_composites(build_indicator_snapshot(frame))
+                dimensions = {
+                    key: {
+                        "score": float(value["score"]),
+                        "status": str(value["status"]),
+                        "count": int(value["count"]),
+                        "weight": float(value["weight"]),
+                    }
+                    for key, value in composites.items()
+                }
+                store.save_daily_score(
+                    security,
+                    score_date,
+                    score,
+                    direction=str(regime["direction"]),
+                    regime=str(regime["regime"]),
+                    dimensions=dimensions,
+                )
+            else:
+                path.write_text(
+                    json.dumps(
+                        {
+                            "score": score,
+                            "beijing_time": score_date.isoformat(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
             return security.key, score
 
         scores: dict[str, float] = {}
@@ -836,6 +881,11 @@ class DataProvider:
                     key, score = future.result()
                     scores[key] = score
                 except Exception:
+                    if self.historical_store is not None:
+                        saved = self.historical_store.daily_score(security)
+                        if saved is not None:
+                            scores[security.key] = float(saved["score"])
+                            continue
                     path = self.cache_dir / (
                         f"score_v3_{security.security_type.value}_{security.code}.json"
                     )
@@ -1226,9 +1276,55 @@ class DataProvider:
         path = self.cache_dir / (
             f"history_{security.security_type.value}_{security.code}_{cache_suffix}.csv"
         )
+        end = beijing_today()
+        start = end - timedelta(days=calendar_days)
+        completed_end = latest_completed_market_day()
+        store = self.historical_store
+        stored = (
+            store.get_bars(
+                security,
+                effective_adjustment,
+                start=start,
+                end=completed_end,
+            )
+            if store is not None
+            else pd.DataFrame()
+        )
+        state_key = effective_adjustment or "raw"
+        state = store.fetch_state(security, "daily_bars", state_key) if store else {}
+        last_attempt = str(state.get("last_attempt_at", ""))[:10]
+        latest_stored = (
+            pd.Timestamp(stored.iloc[-1]["date"]).date()
+            if not stored.empty
+            else None
+        )
+        if use_cache and not stored.empty and (
+            latest_stored is not None
+            and latest_stored >= completed_end
+            or last_attempt == end.isoformat()
+        ):
+            self.history_sources[security.key] = "本地数据库"
+            return (
+                self._merge_live_daily_bar(
+                    security, stored, effective_adjustment
+                )
+                if include_live
+                else stored
+            )
         if use_cache and self._cache_is_fresh(path, timedelta(hours=6)):
             cached = self._read_frame(path)
             if not cached.empty:
+                if store is not None:
+                    completed = cached[
+                        pd.to_datetime(cached["date"], errors="coerce").dt.date
+                        <= completed_end
+                    ]
+                    store.upsert_bars(
+                        security,
+                        completed,
+                        effective_adjustment,
+                        "旧版CSV缓存迁移",
+                    )
                 self.history_sources[security.key] = "本地缓存"
                 return (
                     self._merge_live_daily_bar(security, cached, effective_adjustment)
@@ -1236,8 +1332,6 @@ class DataProvider:
                     else cached
                 )
 
-        end = beijing_today()
-        start = end - timedelta(days=calendar_days)
         start_text = start.strftime("%Y%m%d")
         end_text = end.strftime("%Y%m%d")
         market_symbol = self._market_symbol(security)
@@ -1337,6 +1431,39 @@ class DataProvider:
                 ),
             ]
 
+        def persist_completed_history(frame: pd.DataFrame, source: str) -> None:
+            if not persist:
+                return
+            completed = frame[
+                pd.to_datetime(frame["date"], errors="coerce").dt.date
+                <= completed_end
+            ].copy()
+            if store is not None:
+                store.upsert_bars(
+                    security,
+                    completed,
+                    effective_adjustment,
+                    source,
+                    temporary_last=False,
+                )
+                if not completed.empty:
+                    store.update_fetch_state(
+                        security,
+                        "daily_bars",
+                        state_key,
+                        success=True,
+                        coverage_start=pd.Timestamp(
+                            completed.iloc[0]["date"]
+                        ).strftime("%Y-%m-%d"),
+                        coverage_end=pd.Timestamp(
+                            completed.iloc[-1]["date"]
+                        ).strftime("%Y-%m-%d"),
+                        record_count=len(completed),
+                        source=source,
+                    )
+            else:
+                frame.to_csv(path, index=False, encoding="utf-8-sig")
+
         errors: list[str] = []
         for source, loader in loaders:
             try:
@@ -1349,9 +1476,17 @@ class DataProvider:
                 ]
                 if normalized.empty:
                     raise RuntimeError("返回空数据")
-                if persist:
-                    normalized.to_csv(path, index=False, encoding="utf-8-sig")
+                persist_completed_history(normalized, source)
                 self.history_sources[security.key] = source
+                if store is not None:
+                    database_frame = store.get_bars(
+                        security,
+                        effective_adjustment,
+                        start=start,
+                        end=completed_end,
+                    )
+                    if not database_frame.empty:
+                        normalized = database_frame
                 normalized = normalized.reset_index(drop=True)
                 return (
                     self._merge_live_daily_bar(
@@ -1381,9 +1516,18 @@ class DataProvider:
                 )
                 if normalized.empty:
                     raise RuntimeError("本地复权结果为空")
-                if persist:
-                    normalized.to_csv(path, index=False, encoding="utf-8-sig")
-                self.history_sources[security.key] = "新浪ETF日线 + 分红序列本地复权"
+                source = "新浪ETF日线 + 分红序列本地复权"
+                persist_completed_history(normalized, source)
+                self.history_sources[security.key] = source
+                if store is not None:
+                    database_frame = store.get_bars(
+                        security,
+                        effective_adjustment,
+                        start=start,
+                        end=completed_end,
+                    )
+                    if not database_frame.empty:
+                        normalized = database_frame
                 return (
                     self._merge_live_daily_bar(
                         security, normalized, effective_adjustment
@@ -1393,6 +1537,27 @@ class DataProvider:
                 )
             except Exception as exc:
                 errors.append(f"ETF分红序列本地复权: {exc}")
+        if store is not None:
+            retry = beijing_now() + timedelta(minutes=15 if stored.empty else 120)
+            store.update_fetch_state(
+                security,
+                "daily_bars",
+                state_key,
+                success=False,
+                record_count=len(stored),
+                source=self.history_sources.get(security.key, ""),
+                error="；".join(errors),
+                retry_after=retry.strftime("%Y-%m-%d %H:%M:%S%z"),
+            )
+            if not stored.empty:
+                self.history_sources[security.key] = "本地数据库（网络更新失败）"
+                return (
+                    self._merge_live_daily_bar(
+                        security, stored, effective_adjustment
+                    )
+                    if include_live
+                    else stored
+                )
         if path.exists():
             cached = self._read_frame(path)
             if not cached.empty:
@@ -1470,13 +1635,16 @@ class DataProvider:
             return bundle
         if security.security_type is SecurityType.ETF:
             try:
-                bundle.corporate_actions = self._load_extra_with_cache(
+                bundle.corporate_actions = self._load_persistent_extra(
                     "corporate_actions",
-                    security.code,
+                    security,
                     lambda: self._load_corporate_actions(security),
                     timedelta(hours=24),
+                    "AkShare·ETF分红",
                 )
-                bundle.sources["corporate_actions"] = "AkShare·ETF分红"
+                bundle.sources["corporate_actions"] = str(
+                    bundle.corporate_actions.attrs.get("source", "AkShare·ETF分红")
+                )
             except Exception:
                 bundle.warnings.append("ETF分红标注接口暂时不可用")
             bundle.warnings.append("ETF不提供个股股东与企业财务披露数据。")
@@ -1560,16 +1728,21 @@ class DataProvider:
             ),
         )
         with ThreadPoolExecutor(max_workers=6) as executor:
-            future_map = {
-                executor.submit(
-                    self._load_extra_with_cache,
-                    attribute,
-                    security.code,
-                    loader,
-                    max_age,
-                ): (attribute, warning, source)
-                for attribute, loader, warning, max_age, source in extras
-            }
+            future_map = {}
+            for attribute, loader, warning, max_age, source in extras:
+                future = (
+                    executor.submit(loader)
+                    if attribute in {"fund_flow", "chips"}
+                    else executor.submit(
+                        self._load_persistent_extra,
+                        attribute,
+                        security,
+                        loader,
+                        max_age,
+                        source,
+                    )
+                )
+                future_map[future] = (attribute, warning, source)
             for future in as_completed(future_map):
                 attribute, warning, source = future_map[future]
                 try:
@@ -1723,6 +1896,25 @@ class DataProvider:
     def _load_fund_flow(
         self, security: Security, history: pd.DataFrame
     ) -> pd.DataFrame:
+        store = self.historical_store
+        completed_end = latest_completed_market_day()
+        stored = store.get_fund_flow(security) if store is not None else pd.DataFrame()
+        state = store.fetch_state(security, "fund_flow") if store is not None else {}
+        latest_stored = (
+            pd.to_datetime(stored["日期"], errors="coerce").dt.date.max()
+            if not stored.empty and "日期" in stored
+            else None
+        )
+        if (
+            not stored.empty
+            and latest_stored is not None
+            and latest_stored >= completed_end
+            and str(state.get("last_success_at", ""))[:10]
+            == beijing_today().isoformat()
+        ):
+            stored.attrs["source"] = "本地资金流仓库（已覆盖最近完成交易日）"
+            return stored
+
         errors: list[str] = []
         loaders: tuple[tuple[str, Callable[[], pd.DataFrame]], ...] = (
             (
@@ -1756,12 +1948,73 @@ class DataProvider:
                     raise RuntimeError("未找到该股票")
                 frame = frame.copy()
                 frame.attrs["source"] = frame.attrs.get("source", source)
+                if store is not None and "日期" in frame:
+                    completed = frame[
+                        pd.to_datetime(frame["日期"], errors="coerce").dt.date
+                        <= completed_end
+                    ].copy()
+                    stored_count = store.upsert_fund_flow(
+                        security,
+                        completed,
+                        source=source,
+                        is_estimated=False,
+                    )
+                    store.update_fetch_state(
+                        security,
+                        "fund_flow",
+                        success=True,
+                        coverage_start=(
+                            str(completed["日期"].iloc[0]) if not completed.empty else ""
+                        ),
+                        coverage_end=(
+                            str(completed["日期"].iloc[-1]) if not completed.empty else ""
+                        ),
+                        record_count=stored_count,
+                        source=source,
+                    )
                 return frame
             except Exception as exc:
                 errors.append(f"{source}: {exc}")
+        if not stored.empty:
+            stored.attrs["source"] = "本地资金流仓库（联网更新失败）"
+            stored.attrs["fallback_errors"] = errors
+            if store is not None:
+                store.update_fetch_state(
+                    security,
+                    "fund_flow",
+                    success=False,
+                    record_count=len(stored),
+                    error="；".join(errors),
+                )
+            return stored
         estimated = self._estimate_fund_flow(history)
         estimated.attrs["source"] = "本地OHLCV资金流估算（非逐笔主力）"
         estimated.attrs["fallback_errors"] = errors
+        if store is not None and not estimated.empty:
+            completed = estimated[
+                pd.to_datetime(estimated["日期"], errors="coerce").dt.date
+                <= completed_end
+            ].copy()
+            count = store.upsert_fund_flow(
+                security,
+                completed,
+                source="本地OHLCV资金流估算（非逐笔主力）",
+                is_estimated=True,
+            )
+            store.update_fetch_state(
+                security,
+                "fund_flow",
+                success=bool(count),
+                coverage_start=(
+                    str(completed["日期"].iloc[0]) if not completed.empty else ""
+                ),
+                coverage_end=(
+                    str(completed["日期"].iloc[-1]) if not completed.empty else ""
+                ),
+                record_count=count,
+                source="本地OHLCV资金流估算（非逐笔主力）",
+                error="" if count else "；".join(errors),
+            )
         return estimated
 
     def _estimate_fund_flow(self, history: pd.DataFrame) -> pd.DataFrame:
@@ -1795,6 +2048,28 @@ class DataProvider:
     def _load_chips(
         self, security: Security, history: pd.DataFrame, adjustment: str
     ) -> pd.DataFrame:
+        store = self.historical_store
+        completed_end = latest_completed_market_day()
+        stored = store.get_chips(security) if store is not None else pd.DataFrame()
+        state = (
+            store.fetch_state(security, "chips", adjustment or "raw")
+            if store is not None
+            else {}
+        )
+        latest_stored = (
+            pd.to_datetime(stored["日期"], errors="coerce").dt.date.max()
+            if not stored.empty and "日期" in stored
+            else None
+        )
+        if (
+            not stored.empty
+            and latest_stored is not None
+            and latest_stored >= completed_end
+            and str(state.get("last_success_at", ""))[:10]
+            == beijing_today().isoformat()
+        ):
+            stored.attrs["source"] = "本地筹码仓库（公开接口原始结果）"
+            return stored
         try:
             frame = self._call_with_timeout(
                 lambda: ak.stock_cyq_em(symbol=security.code, adjust=adjustment),
@@ -1804,8 +2079,46 @@ class DataProvider:
                 raise RuntimeError("筹码接口返回空数据")
             frame = frame.copy()
             frame.attrs["source"] = "AkShare·东方财富筹码分布"
+            if store is not None and "日期" in frame:
+                completed = frame[
+                    pd.to_datetime(frame["日期"], errors="coerce").dt.date
+                    <= completed_end
+                ].copy()
+                count = store.upsert_chips(
+                    security,
+                    completed,
+                    source="AkShare·东方财富筹码分布",
+                    is_estimated=False,
+                )
+                store.update_fetch_state(
+                    security,
+                    "chips",
+                    adjustment or "raw",
+                    success=True,
+                    coverage_start=(
+                        str(completed["日期"].iloc[0]) if not completed.empty else ""
+                    ),
+                    coverage_end=(
+                        str(completed["日期"].iloc[-1]) if not completed.empty else ""
+                    ),
+                    record_count=count,
+                    source="AkShare·东方财富筹码分布",
+                )
             return frame
         except Exception as exc:
+            if not stored.empty:
+                stored.attrs["source"] = "本地筹码仓库（联网更新失败）"
+                stored.attrs["error"] = str(exc)
+                if store is not None:
+                    store.update_fetch_state(
+                        security,
+                        "chips",
+                        adjustment or "raw",
+                        success=False,
+                        record_count=len(stored),
+                        error=str(exc),
+                    )
+                return stored
             # Cost-distribution reconstruction is a model, not disclosed exchange data.
             # Returning an explicit empty result prevents estimated values being shown as
             # real chips, profit chips, average cost or concentration.
@@ -1813,6 +2126,116 @@ class DataProvider:
             frame.attrs["source"] = "东方财富筹码接口无可靠返回"
             frame.attrs["error"] = str(exc)
             return frame
+
+    def get_price_reasons(self, security: Security) -> dict[str, object]:
+        """Return public intraday anomaly evidence without inventing a causal story."""
+
+        quote = self._fetch_direct_quote(security)
+        if security.security_type is not SecurityType.STOCK:
+            return {
+                "quote": quote,
+                "events": pd.DataFrame(
+                    columns=["时间", "类型", "说明", "来源"]
+                ),
+                "summary": "ETF和指数暂无可靠的个股涨跌原因接口。",
+                "source": "公开实时行情",
+            }
+
+        positive = (quote.change_pct or 0) >= 0
+        categories = (
+            ("火箭发射", "快速反弹", "大笔买入", "封涨停板", "打开跌停板")
+            if positive
+            else ("高台跳水", "加速下跌", "大笔卖出", "封跌停板", "打开涨停板")
+        )
+        records: list[dict[str, object]] = []
+
+        def load_change(category: str) -> pd.DataFrame:
+            return self._call_with_timeout(
+                lambda: ak.stock_changes_em(symbol=category), 4
+            )
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(load_change, category): category
+                for category in categories
+            }
+            for future in as_completed(futures):
+                category = futures[future]
+                try:
+                    frame = future.result()
+                except Exception:
+                    continue
+                if frame is None or frame.empty:
+                    continue
+                code_column = next(
+                    (
+                        name
+                        for name in ("代码", "股票代码", "证券代码")
+                        if name in frame
+                    ),
+                    None,
+                )
+                if code_column is None:
+                    continue
+                matched = frame[
+                    frame[code_column].map(self._normalized_code) == security.code
+                ]
+                for _, row in matched.iterrows():
+                    records.append(
+                        {
+                            "时间": str(row.get("时间", "")),
+                            "类型": str(row.get("板块", row.get("异动类型", category))),
+                            "说明": str(row.get("相关信息", row.get("异动信息", ""))),
+                            "来源": "AkShare·东方财富盘口异动",
+                        }
+                    )
+
+        day_text = beijing_today().strftime("%Y%m%d")
+        try:
+            pool = self._call_with_timeout(
+                lambda: ak.stock_zt_pool_em(date=day_text), 5
+            )
+            if pool is not None and not pool.empty:
+                code_column = next(
+                    (name for name in ("代码", "股票代码") if name in pool), None
+                )
+                matched = (
+                    pool[pool[code_column].map(self._normalized_code) == security.code]
+                    if code_column
+                    else pd.DataFrame()
+                )
+                if not matched.empty:
+                    row = matched.iloc[0]
+                    details = [
+                        f"{name}：{row.get(name)}"
+                        for name in ("所属行业", "首次封板时间", "最后封板时间", "炸板次数", "连板数")
+                        if name in row.index and pd.notna(row.get(name))
+                    ]
+                    records.append(
+                        {
+                            "时间": str(row.get("最后封板时间", "")),
+                            "类型": "涨停池",
+                            "说明": "；".join(details) or "进入当日公开涨停池",
+                            "来源": "AkShare·东方财富涨停池",
+                        }
+                    )
+        except Exception:
+            pass
+
+        events = pd.DataFrame(records, columns=["时间", "类型", "说明", "来源"])
+        if not events.empty:
+            events = events.drop_duplicates().sort_values(
+                "时间", ascending=False
+            ).reset_index(drop=True)
+            summary = f"检索到 {len(events)} 条公开盘口异动或涨停池证据。"
+        else:
+            summary = "当前公开源未检索到可核验的涨跌原因；程序不根据涨跌幅自行编造原因。"
+        return {
+            "quote": quote,
+            "events": events,
+            "summary": summary,
+            "source": "东方财富盘口异动/涨停池 + 实时行情",
+        }
 
     @staticmethod
     def _weighted_quantile(
@@ -1880,18 +2303,42 @@ class DataProvider:
     ) -> tuple[pd.DataFrame, str]:
         if period not in {"1", "5", "15", "30", "60"}:
             raise ValueError("分时周期只支持 1/5/15/30/60 分钟")
+        store = self.historical_store
+        completed = trading_day <= latest_completed_market_day()
+        stored = (
+            store.get_intraday_bars(security, trading_day)
+            if store is not None
+            else pd.DataFrame()
+        )
+        if completed and not stored.empty:
+            return self._resample_intraday(stored, int(period)), "本地一分钟分时数据库"
+
         path = self.cache_dir / (
-            f"intraday_{security.security_type.value}_{security.code}_{trading_day:%Y%m%d}_{period}.csv"
+            f"intraday_{security.security_type.value}_{security.code}_{trading_day:%Y%m%d}_1.csv"
         )
         max_age = (
             timedelta(seconds=20)
-            if trading_day == beijing_today()
+            if not completed
             else timedelta(days=3650)
         )
         if self._cache_is_fresh(path, max_age):
             cached = self._read_frame(path)
             if not cached.empty:
-                return cached, "本地分时缓存"
+                if completed and store is not None:
+                    store.upsert_intraday_bars(
+                        security, cached, period_minutes=1, source="旧版分时缓存迁移"
+                    )
+                    store.update_fetch_state(
+                        security,
+                        "intraday",
+                        trading_day.isoformat(),
+                        success=True,
+                        coverage_start=trading_day.isoformat(),
+                        coverage_end=trading_day.isoformat(),
+                        record_count=len(cached),
+                        source="旧版分时缓存迁移",
+                    )
+                return self._resample_intraday(cached, int(period)), "本地分时缓存"
 
         start = f"{trading_day:%Y-%m-%d} 09:15:00"
         end = f"{trading_day:%Y-%m-%d} 15:15:00"
@@ -1905,14 +2352,14 @@ class DataProvider:
                         symbol=security.code,
                         start_date=start,
                         end_date=end,
-                        period=period,
+                        period="1",
                         adjust="",
                     ),
                 ),
                 (
                     "AkShare·新浪股票分时",
                     lambda: ak.stock_zh_a_minute(
-                        symbol=market_symbol, period=period, adjust=""
+                        symbol=market_symbol, period="1", adjust=""
                     ),
                 ),
             ]
@@ -1924,14 +2371,14 @@ class DataProvider:
                         symbol=security.code,
                         start_date=start,
                         end_date=end,
-                        period=period,
+                        period="1",
                         adjust="",
                     ),
                 ),
                 (
                     "AkShare·新浪ETF分时",
                     lambda: ak.stock_zh_a_minute(
-                        symbol=market_symbol, period=period, adjust=""
+                        symbol=market_symbol, period="1", adjust=""
                     ),
                 ),
             ]
@@ -1941,7 +2388,7 @@ class DataProvider:
                     "AkShare·东方财富指数分时",
                     lambda: ak.index_zh_a_hist_min_em(
                         symbol=security.code,
-                        period=period,
+                        period="1",
                         start_date=start,
                         end_date=end,
                     ),
@@ -1949,7 +2396,7 @@ class DataProvider:
                 (
                     "AkShare·新浪指数分时",
                     lambda: ak.stock_zh_a_minute(
-                        symbol=market_symbol, period=period, adjust=""
+                        symbol=market_symbol, period="1", adjust=""
                     ),
                 ),
             ]
@@ -1963,13 +2410,69 @@ class DataProvider:
                 )
                 if frame.empty:
                     raise RuntimeError("该日期无分时数据")
-                frame.to_csv(path, index=False, encoding="utf-8-sig")
-                return frame, source
+                if completed and store is not None:
+                    store.upsert_intraday_bars(
+                        security, frame, period_minutes=1, source=source
+                    )
+                    store.update_fetch_state(
+                        security,
+                        "intraday",
+                        trading_day.isoformat(),
+                        success=True,
+                        coverage_start=trading_day.isoformat(),
+                        coverage_end=trading_day.isoformat(),
+                        record_count=len(frame),
+                        source=source,
+                    )
+                elif not completed:
+                    # 当日实时数据只放短时文件缓存，不进入长期数据库。
+                    frame.to_csv(path, index=False, encoding="utf-8-sig")
+                return self._resample_intraday(frame, int(period)), source
             except Exception as exc:
                 errors.append(f"{source}: {exc}")
+        if store is not None:
+            retry = beijing_now() + timedelta(minutes=10 if not completed else 120)
+            store.update_fetch_state(
+                security,
+                "intraday",
+                trading_day.isoformat(),
+                success=False,
+                record_count=len(stored),
+                error="；".join(errors),
+                retry_after=retry.strftime("%Y-%m-%d %H:%M:%S%z"),
+            )
+            if not stored.empty:
+                return (
+                    self._resample_intraday(stored, int(period)),
+                    "本地一分钟分时数据库（网络更新失败）",
+                )
         raise RuntimeError(
             "该日期暂无可用分时数据（1分钟通常仅保留近5个交易日）：" + "；".join(errors)
         )
+
+    @staticmethod
+    def _resample_intraday(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
+        if frame is None or frame.empty or minutes == 1:
+            return frame.reset_index(drop=True) if frame is not None else pd.DataFrame()
+        source = frame.copy()
+        source["date"] = pd.to_datetime(source["date"], errors="coerce")
+        source = source.dropna(subset=["date"]).set_index("date")
+        aggregation: dict[str, str] = {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+        }
+        for column in ("volume", "amount", "turnover"):
+            if column in source:
+                aggregation[column] = "sum"
+        result = (
+            source.resample(f"{minutes}min", origin="start_day")
+            .agg(aggregation)
+            .dropna(subset=["open", "high", "low", "close"])
+            .reset_index()
+        )
+        return result
 
     def get_news(self, security: Security, force: bool = False) -> list[NewsArticle]:
         path = (
@@ -2297,6 +2800,76 @@ class DataProvider:
                         ).strip()
                     except OSError:
                         pass
+                return cached
+            raise
+
+    def _load_persistent_extra(
+        self,
+        name: str,
+        security: Security,
+        loader: Callable[[], pd.DataFrame],
+        max_age: timedelta,
+        default_source: str = "",
+    ) -> pd.DataFrame:
+        """Keep reusable company datasets in SQLite and serve stale data on outages."""
+
+        store = self.historical_store
+        if store is None:
+            return self._load_extra_with_cache(
+                name, security.code, loader, max_age
+            )
+        cached, metadata = store.load_dataset_snapshot(security, name)
+        fetched_at = str(metadata.get("fetched_at", ""))
+        if not cached.empty and fetched_at:
+            try:
+                fetched = pd.Timestamp(fetched_at)
+                now = pd.Timestamp(beijing_now())
+                if fetched.tzinfo is None:
+                    fetched = fetched.tz_localize("Asia/Shanghai")
+                if now - fetched <= max_age:
+                    cached.attrs["source"] = str(
+                        metadata.get("source") or default_source or "本地数据库"
+                    )
+                    return cached
+            except (TypeError, ValueError):
+                pass
+        try:
+            frame = self._call_with_timeout(loader, 15)
+            if frame is None or frame.empty:
+                raise RuntimeError("数据源返回空数据")
+            source = str(frame.attrs.get("source") or default_source)
+            store.save_dataset_snapshot(
+                security,
+                name,
+                frame,
+                source=source,
+                as_of_date=latest_completed_market_day(),
+            )
+            store.update_fetch_state(
+                security,
+                "dataset",
+                name,
+                success=True,
+                record_count=len(frame),
+                source=source,
+            )
+            frame.attrs["source"] = source
+            return frame
+        except Exception as exc:
+            store.update_fetch_state(
+                security,
+                "dataset",
+                name,
+                success=False,
+                record_count=len(cached),
+                source=str(metadata.get("source", "")),
+                error=str(exc),
+            )
+            if not cached.empty:
+                cached.attrs["source"] = (
+                    str(metadata.get("source") or default_source or "本地数据库")
+                    + "（联网更新失败，使用上次成功数据）"
+                )
                 return cached
             raise
 

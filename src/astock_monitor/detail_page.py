@@ -57,7 +57,7 @@ from .indicators import (
 )
 from .models import CustomIndicator, NewsArticle, Security, SecurityType
 from .repository import Repository
-from .time_utils import beijing_today
+from .time_utils import beijing_today, latest_completed_market_day
 from .ui_common import (
     DOWN_COLOR,
     UP_COLOR,
@@ -197,7 +197,7 @@ class DetailPage(QWidget):
         self.tabs.addTab(detail_pages["f10"], "简况（F10）")
         self.tabs.addTab(detail_pages["funds"], "资金")
         self.tabs.addTab(detail_pages["chips"], "筹码")
-        self.tabs.addTab(self.order_book_tab, "盘口")
+        self.tabs.addTab(self.order_book_tab, "涨跌原因")
         self.tabs.addTab(detail_pages["finance"], "财务")
         self.tabs.addTab(self.news_tab, "企业公告/新闻/资讯")
         self.tabs.addTab(self.event_timeline_tab, "公司事件")
@@ -300,24 +300,48 @@ class DetailPage(QWidget):
         layout.setContentsMargins(0, 12, 0, 0)
         controls = QHBoxLayout()
         self.order_book_status = QLabel(
-            "公开五档盘口（非Level-2），只在刷新时请求一份快照。"
+            "按同花顺“涨跌原因”的使用方式展示公开盘口异动、封板与炸板证据；没有可靠来源时明确留空。"
         )
         self.order_book_status.setObjectName("Muted")
+        self.order_book_status.setWordWrap(True)
         controls.addWidget(self.order_book_status)
         controls.addStretch(1)
-        self.order_book_button = QPushButton("刷新盘口")
+        self.order_book_button = QPushButton("刷新涨跌原因")
         self.order_book_button.clicked.connect(self._load_order_book)
         controls.addWidget(self.order_book_button)
         layout.addLayout(controls)
-        self.order_book_table = QTableWidget(10, 4)
+        cards = QHBoxLayout()
+        self.reason_price_card = MetricCard("最新价")
+        self.reason_change_card = MetricCard("涨跌幅")
+        self.reason_event_card = MetricCard("公开异动")
+        self.reason_source_card = MetricCard("证据来源")
+        for card in (
+            self.reason_price_card,
+            self.reason_change_card,
+            self.reason_event_card,
+            self.reason_source_card,
+        ):
+            card.setMinimumHeight(82)
+            cards.addWidget(card)
+        layout.addLayout(cards)
+        self.order_book_table = QTableWidget(0, 4)
         self.order_book_table.setHorizontalHeaderLabels(
-            ["方向", "档位", "价格", "委托量"]
+            ["时间", "异动/状态", "公开说明", "来源"]
         )
         configure_table(self.order_book_table)
-        self.order_book_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
+        header = self.order_book_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.order_book_table, 1)
+        note = QLabel(
+            "说明：公开“盘口异动”只能证明某类交易现象发生，不能证明资金主体或真实因果。"
+            "本页不把新闻、K线形态或估算值包装成涨跌原因。"
+        )
+        note.setObjectName("Tiny")
+        note.setWordWrap(True)
+        layout.addWidget(note)
         return page
 
     def _build_overview_tab(self) -> QWidget:
@@ -1420,10 +1444,12 @@ class DetailPage(QWidget):
             return
         self._order_book_running = True
         self.order_book_button.setEnabled(False)
-        worker = Worker(self.provider.get_order_book, self.security)
+        worker = Worker(self.provider.get_price_reasons, self.security)
         worker.signals.result.connect(self._show_order_book)
         worker.signals.error.connect(
-            lambda message: self.order_book_status.setText(f"盘口暂不可用：{message}")
+            lambda message: self.order_book_status.setText(
+                f"涨跌原因暂不可用：{message}"
+            )
         )
         worker.signals.finished.connect(
             lambda: (
@@ -1436,29 +1462,26 @@ class DetailPage(QWidget):
     def _show_order_book(self, value: object) -> None:
         if not isinstance(value, dict):
             return
-        rows = []
-        for side, label in (("asks", "卖"), ("bids", "买")):
-            entries = value.get(side, [])
-            if side == "asks":
-                entries = list(reversed(entries))
-            for entry in entries:
-                if isinstance(entry, dict):
-                    rows.append(
-                        (
-                            label,
-                            entry.get("level"),
-                            entry.get("price"),
-                            entry.get("volume"),
-                        )
-                    )
-        self.order_book_table.setRowCount(len(rows))
-        for r, values in enumerate(rows):
-            for c, item in enumerate(values):
+        quote = value.get("quote")
+        price = getattr(quote, "price", None)
+        change = getattr(quote, "change_pct", None)
+        self.reason_price_card.set_value(format_number(price), "公开实时行情")
+        self.reason_change_card.set_value(
+            format_percent(change), "相对昨收", change_color(change)
+        )
+        events = value.get("events")
+        frame = events if isinstance(events, pd.DataFrame) else pd.DataFrame()
+        self.reason_event_card.set_value(f"{len(frame)} 条", "可核验证据")
+        self.reason_source_card.set_value("公开源", str(value.get("source", "—")))
+        self.order_book_table.setRowCount(len(frame))
+        columns = ("时间", "类型", "说明", "来源")
+        for r, (_, row) in enumerate(frame.iterrows()):
+            for c, name in enumerate(columns):
                 self.order_book_table.setItem(
-                    r, c, QTableWidgetItem(format_number(item) if c >= 2 else str(item))
+                    r, c, QTableWidgetItem(str(row.get(name, "") or "—"))
                 )
         self.order_book_status.setText(
-            f"已刷新 · {value.get('source', '公开五档行情')} · 不含逐笔、队列和撤单数据"
+            str(value.get("summary", "已刷新公开涨跌原因证据。"))
         )
 
     def _select_fundamental_page(self, index: int) -> None:
@@ -1558,6 +1581,36 @@ class DetailPage(QWidget):
                 f"{composite['status']} · {float(composite['score']):.0f}"
             )
             self.signal_table.setCellWidget(row, 2, pill)
+        if self.security is not None and self.bundle is not None:
+            completed_history = self.bundle.history[
+                pd.to_datetime(self.bundle.history["date"], errors="coerce").dt.date
+                <= latest_completed_market_day()
+            ]
+            if not completed_history.empty:
+                completed_frame = calculate_indicators(
+                    completed_history, include_extended=False
+                )
+                completed_regime = market_regime(completed_frame)
+                completed_dimensions = dimension_composites(
+                    build_indicator_snapshot(completed_frame)
+                )
+                score_date = pd.Timestamp(completed_frame.iloc[-1]["date"]).date()
+                self.historical_store.save_daily_score(
+                    self.security,
+                    score_date,
+                    float(completed_regime["score"]),
+                    direction=str(completed_regime["direction"]),
+                    regime=str(completed_regime["regime"]),
+                    dimensions={
+                        key: {
+                            "score": float(item["score"]),
+                            "status": str(item["status"]),
+                            "count": int(item["count"]),
+                            "weight": float(item["weight"]),
+                        }
+                        for key, item in completed_dimensions.items()
+                    },
+                )
 
     def _populate_indicators(self) -> None:
         self.indicator_table.setRowCount(len(self.snapshots))

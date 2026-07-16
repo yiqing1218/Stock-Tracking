@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import json
 import sqlite3
 from dataclasses import asdict, dataclass
 from datetime import date
+from io import StringIO
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -454,6 +456,105 @@ class HistoricalStore:
                     metric_key TEXT NOT NULL, metric_value REAL, metric_text TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(run_id, metric_key)
                 );
+
+                CREATE TABLE IF NOT EXISTS intraday_bars (
+                    security_id INTEGER NOT NULL REFERENCES securities(id) ON DELETE CASCADE,
+                    trade_date TEXT NOT NULL,
+                    trade_time TEXT NOT NULL,
+                    period_minutes INTEGER NOT NULL DEFAULT 1,
+                    open REAL, high REAL, low REAL, close REAL,
+                    volume REAL, amount REAL, turnover REAL,
+                    source TEXT NOT NULL DEFAULT '',
+                    fetched_at TEXT NOT NULL,
+                    quality_flags TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(security_id, trade_time, period_minutes)
+                );
+                CREATE INDEX IF NOT EXISTS idx_intraday_security_date
+                    ON intraday_bars(security_id, trade_date, period_minutes, trade_time);
+                CREATE INDEX IF NOT EXISTS idx_intraday_date
+                    ON intraday_bars(trade_date, period_minutes, security_id);
+
+                CREATE TABLE IF NOT EXISTS security_daily_scores (
+                    security_id INTEGER NOT NULL REFERENCES securities(id) ON DELETE CASCADE,
+                    trade_date TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    direction TEXT NOT NULL DEFAULT '',
+                    regime TEXT NOT NULL DEFAULT '',
+                    dimension_scores_json TEXT NOT NULL DEFAULT '{}',
+                    formula_version TEXT NOT NULL DEFAULT 'regime_v3',
+                    source TEXT NOT NULL DEFAULT 'local_indicators',
+                    computed_at TEXT NOT NULL,
+                    PRIMARY KEY(security_id, trade_date, formula_version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_security_scores_date
+                    ON security_daily_scores(trade_date, score DESC);
+
+                CREATE TABLE IF NOT EXISTS fund_flow_daily (
+                    security_id INTEGER NOT NULL REFERENCES securities(id) ON DELETE CASCADE,
+                    trade_date TEXT NOT NULL,
+                    main_net REAL, main_ratio REAL,
+                    extra_large_net REAL, large_net REAL, medium_net REAL, small_net REAL,
+                    source TEXT NOT NULL DEFAULT '',
+                    is_estimated INTEGER NOT NULL DEFAULT 0,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY(security_id, trade_date, source)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fund_flow_security_date
+                    ON fund_flow_daily(security_id, trade_date DESC);
+
+                CREATE TABLE IF NOT EXISTS chip_daily (
+                    security_id INTEGER NOT NULL REFERENCES securities(id) ON DELETE CASCADE,
+                    trade_date TEXT NOT NULL,
+                    profit_ratio REAL, average_cost REAL,
+                    cost90_low REAL, cost90_high REAL, concentration90 REAL,
+                    cost70_low REAL, cost70_high REAL, concentration70 REAL,
+                    source TEXT NOT NULL DEFAULT '',
+                    is_estimated INTEGER NOT NULL DEFAULT 0,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY(security_id, trade_date, source)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chip_security_date
+                    ON chip_daily(security_id, trade_date DESC);
+
+                CREATE TABLE IF NOT EXISTS security_dataset_snapshots (
+                    security_id INTEGER NOT NULL REFERENCES securities(id) ON DELETE CASCADE,
+                    dataset_kind TEXT NOT NULL,
+                    as_of_date TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT '',
+                    fetched_at TEXT NOT NULL,
+                    record_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(security_id, dataset_kind)
+                );
+
+                CREATE TABLE IF NOT EXISTS data_fetch_state (
+                    security_id INTEGER NOT NULL REFERENCES securities(id) ON DELETE CASCADE,
+                    data_kind TEXT NOT NULL,
+                    data_key TEXT NOT NULL DEFAULT '',
+                    coverage_start TEXT NOT NULL DEFAULT '',
+                    coverage_end TEXT NOT NULL DEFAULT '',
+                    last_attempt_at TEXT NOT NULL DEFAULT '',
+                    last_success_at TEXT NOT NULL DEFAULT '',
+                    retry_after TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    record_count INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(security_id, data_kind, data_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fetch_state_retry
+                    ON data_fetch_state(data_kind, retry_after);
+
+                CREATE TABLE IF NOT EXISTS market_breadth_daily (
+                    trade_date TEXT PRIMARY KEY,
+                    up_count INTEGER, down_count INTEGER, flat_count INTEGER,
+                    limit_up_count INTEGER, limit_down_count INTEGER,
+                    broken_limit_count INTEGER, max_limit_streak INTEGER,
+                    amount REAL, amount_change REAL,
+                    median_return REAL, equal_weight_return REAL,
+                    market_volatility REAL, chengjian_market_score REAL,
+                    source TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -812,6 +913,120 @@ class HistoricalStore:
                     count += 1
         return count
 
+    def export_dataset_csv(
+        self,
+        dataset: str,
+        output: Path,
+        securities: Iterable[Security] | None = None,
+        adjustment: str = "qfq",
+        start: str = "",
+        end: str = "",
+    ) -> int:
+        """Stream one durable SQLite dataset to CSV without reading file caches."""
+
+        if dataset == "daily_bars":
+            return self.export_csv(
+                output, securities, adjustment, start, end
+            )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        count = 0
+        if dataset == "market_breadth":
+            with self.connect() as db, output.open(
+                "w", newline="", encoding="utf-8-sig"
+            ) as handle:
+                sql = "SELECT * FROM market_breadth_daily WHERE 1=1"
+                params: list[object] = []
+                if start:
+                    sql += " AND trade_date>=?"
+                    params.append(start)
+                if end:
+                    sql += " AND trade_date<=?"
+                    params.append(end)
+                sql += " ORDER BY trade_date"
+                cursor = db.execute(sql, params)
+                writer = csv.writer(handle)
+                writer.writerow([item[0] for item in cursor.description])
+                while True:
+                    rows = cursor.fetchmany(2000)
+                    if not rows:
+                        break
+                    writer.writerows([tuple(row) for row in rows])
+                    count += len(rows)
+            return count
+
+        queries = {
+            "intraday_bars": (
+                """SELECT trade_time,open,high,low,close,volume,amount,turnover,
+                source,fetched_at FROM intraday_bars
+                WHERE security_id=? AND period_minutes=1""",
+                "trade_date",
+            ),
+            "daily_scores": (
+                """SELECT trade_date,score,direction,regime,dimension_scores_json,
+                formula_version,source,computed_at FROM security_daily_scores
+                WHERE security_id=?""",
+                "trade_date",
+            ),
+            "fund_flow": (
+                """SELECT trade_date,main_net,main_ratio,extra_large_net,large_net,
+                medium_net,small_net,source,is_estimated,fetched_at
+                FROM fund_flow_daily WHERE security_id=?""",
+                "trade_date",
+            ),
+            "chips": (
+                """SELECT trade_date,profit_ratio,average_cost,cost90_low,cost90_high,
+                concentration90,cost70_low,cost70_high,concentration70,source,
+                is_estimated,fetched_at FROM chip_daily WHERE security_id=?""",
+                "trade_date",
+            ),
+        }
+        if dataset not in queries:
+            raise ValueError("不支持的数据导出类型")
+        base_sql, date_column = queries[dataset]
+        items = list(securities) if securities is not None else self.list_securities()
+        header_written = False
+        with output.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            with self.connect() as db:
+                for security in items:
+                    security_id = self.security_id(security)
+                    if security_id is None:
+                        continue
+                    sql = base_sql
+                    params: list[object] = [security_id]
+                    if start:
+                        sql += f" AND {date_column}>=?"
+                        params.append(start)
+                    if end:
+                        sql += f" AND {date_column}<=?"
+                        params.append(end)
+                    sql += f" ORDER BY {date_column}"
+                    cursor = db.execute(sql, params)
+                    if not header_written:
+                        writer.writerow(
+                            ["代码", "名称", "市场", "类型"]
+                            + [item[0] for item in cursor.description]
+                        )
+                        header_written = True
+                    while True:
+                        rows = cursor.fetchmany(2000)
+                        if not rows:
+                            break
+                        writer.writerows(
+                            [
+                                (
+                                    security.code,
+                                    security.name,
+                                    security.market,
+                                    security.security_type.value,
+                                    *tuple(row),
+                                )
+                                for row in rows
+                            ]
+                        )
+                        count += len(rows)
+        return count
+
     def import_cache_directory(self, cache_dir: Path) -> tuple[int, int]:
         files = 0
         bars = 0
@@ -849,3 +1064,572 @@ class HistoricalStore:
 
     def database_report(self) -> dict:
         return asdict(self.summary())
+
+    def upsert_intraday_bars(
+        self,
+        security: Security,
+        frame: pd.DataFrame,
+        *,
+        period_minutes: int = 1,
+        source: str = "",
+    ) -> int:
+        """Persist completed intraday bars. Realtime partial bars stay in memory only."""
+
+        if period_minutes != 1:
+            raise ValueError("本地分时仓库只保存1分钟原始数据")
+        if frame is None or frame.empty:
+            return 0
+        security_id = self.upsert_security(security, source)
+        normalized = frame.copy()
+        normalized["date"] = pd.to_datetime(normalized.get("date"), errors="coerce")
+        normalized = normalized.dropna(subset=["date", "open", "high", "low", "close"])
+        now = self._now()
+        rows: list[tuple[object, ...]] = []
+        for _, row in normalized.iterrows():
+            timestamp = pd.Timestamp(row["date"])
+            rows.append(
+                (
+                    security_id,
+                    timestamp.strftime("%Y-%m-%d"),
+                    timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    1,
+                    self._number(row.get("open")),
+                    self._number(row.get("high")),
+                    self._number(row.get("low")),
+                    self._number(row.get("close")),
+                    self._number(row.get("volume")),
+                    self._number(row.get("amount")),
+                    self._number(row.get("turnover")),
+                    source,
+                    now,
+                    "",
+                )
+            )
+        with self.connect() as db:
+            db.executemany(
+                """INSERT INTO intraday_bars
+                (security_id,trade_date,trade_time,period_minutes,open,high,low,close,
+                 volume,amount,turnover,source,fetched_at,quality_flags)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(security_id,trade_time,period_minutes) DO UPDATE SET
+                open=excluded.open,high=excluded.high,low=excluded.low,close=excluded.close,
+                volume=excluded.volume,amount=excluded.amount,turnover=excluded.turnover,
+                source=excluded.source,fetched_at=excluded.fetched_at,
+                quality_flags=excluded.quality_flags""",
+                rows,
+            )
+        return len(rows)
+
+    def get_intraday_bars(
+        self,
+        security: Security,
+        trading_day: date | str,
+        *,
+        period_minutes: int = 1,
+    ) -> pd.DataFrame:
+        security_id = self.security_id(security)
+        if security_id is None:
+            return pd.DataFrame()
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT trade_time AS date,open,close,high,low,volume,amount,turnover,
+                source FROM intraday_bars
+                WHERE security_id=? AND trade_date=? AND period_minutes=?
+                ORDER BY trade_time""",
+                (security_id, str(trading_day), period_minutes),
+            ).fetchall()
+        frame = pd.DataFrame([dict(row) for row in rows])
+        if not frame.empty:
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        return frame
+
+    def intraday_dates(
+        self, security: Security, *, limit: int = 5000
+    ) -> list[str]:
+        security_id = self.security_id(security)
+        if security_id is None:
+            return []
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT DISTINCT trade_date FROM intraday_bars
+                WHERE security_id=? AND period_minutes=1
+                ORDER BY trade_date DESC LIMIT ?""",
+                (security_id, max(1, min(limit, 20000))),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def save_daily_score(
+        self,
+        security: Security,
+        trade_date: date | str,
+        score: float,
+        *,
+        direction: str = "",
+        regime: str = "",
+        dimensions: dict[str, object] | None = None,
+        formula_version: str = "regime_v3",
+        source: str = "local_indicators",
+    ) -> None:
+        security_id = self.upsert_security(security, source)
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO security_daily_scores
+                (security_id,trade_date,score,direction,regime,dimension_scores_json,
+                 formula_version,source,computed_at)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(security_id,trade_date,formula_version) DO UPDATE SET
+                score=excluded.score,direction=excluded.direction,regime=excluded.regime,
+                dimension_scores_json=excluded.dimension_scores_json,
+                source=excluded.source,computed_at=excluded.computed_at""",
+                (
+                    security_id,
+                    str(trade_date),
+                    float(score),
+                    direction,
+                    regime,
+                    json.dumps(dimensions or {}, ensure_ascii=False),
+                    formula_version,
+                    source,
+                    self._now(),
+                ),
+            )
+
+    def daily_score(
+        self,
+        security: Security,
+        trade_date: date | str | None = None,
+        *,
+        formula_version: str = "regime_v3",
+    ) -> dict[str, object] | None:
+        security_id = self.security_id(security)
+        if security_id is None:
+            return None
+        where = "security_id=? AND formula_version=?"
+        params: list[object] = [security_id, formula_version]
+        if trade_date is not None:
+            where += " AND trade_date=?"
+            params.append(str(trade_date))
+        with self.connect() as db:
+            row = db.execute(
+                f"""SELECT * FROM security_daily_scores WHERE {where}
+                ORDER BY trade_date DESC LIMIT 1""",
+                params,
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["dimensions"] = json.loads(
+                str(result.pop("dimension_scores_json", "{}"))
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result["dimensions"] = {}
+        return result
+
+    def upsert_fund_flow(
+        self,
+        security: Security,
+        frame: pd.DataFrame,
+        *,
+        source: str,
+        is_estimated: bool = False,
+    ) -> int:
+        if frame is None or frame.empty:
+            return 0
+        security_id = self.upsert_security(security, source)
+        now = self._now()
+        rows: list[tuple[object, ...]] = []
+        for _, row in frame.iterrows():
+            parsed_date = pd.to_datetime(row.get("日期"), errors="coerce")
+            if pd.isna(parsed_date):
+                continue
+            rows.append(
+                (
+                    security_id,
+                    pd.Timestamp(parsed_date).strftime("%Y-%m-%d"),
+                    self._number(row.get("主力净流入-净额")),
+                    self._number(row.get("主力净流入-净占比")),
+                    self._number(row.get("超大单净流入-净额")),
+                    self._number(row.get("大单净流入-净额")),
+                    self._number(row.get("中单净流入-净额")),
+                    self._number(row.get("小单净流入-净额")),
+                    source,
+                    int(is_estimated),
+                    now,
+                )
+            )
+        with self.connect() as db:
+            db.executemany(
+                """INSERT INTO fund_flow_daily
+                (security_id,trade_date,main_net,main_ratio,extra_large_net,large_net,
+                 medium_net,small_net,source,is_estimated,fetched_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(security_id,trade_date,source) DO UPDATE SET
+                main_net=excluded.main_net,main_ratio=excluded.main_ratio,
+                extra_large_net=excluded.extra_large_net,large_net=excluded.large_net,
+                medium_net=excluded.medium_net,small_net=excluded.small_net,
+                is_estimated=excluded.is_estimated,fetched_at=excluded.fetched_at""",
+                rows,
+            )
+        return len(rows)
+
+    def get_fund_flow(self, security: Security, limit: int = 160) -> pd.DataFrame:
+        security_id = self.security_id(security)
+        if security_id is None:
+            return pd.DataFrame()
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT trade_date AS 日期,main_net AS "主力净流入-净额",
+                main_ratio AS "主力净流入-净占比",
+                extra_large_net AS "超大单净流入-净额",
+                large_net AS "大单净流入-净额",
+                medium_net AS "中单净流入-净额",small_net AS "小单净流入-净额",
+                source,is_estimated,fetched_at
+                FROM fund_flow_daily WHERE security_id=?
+                ORDER BY trade_date DESC,is_estimated ASC,fetched_at DESC LIMIT ?""",
+                (security_id, max(1, min(limit * 3, 5000))),
+            ).fetchall()
+        frame = pd.DataFrame([dict(row) for row in rows])
+        if frame.empty:
+            return frame
+        frame = (
+            frame.sort_values(
+                ["日期", "is_estimated", "fetched_at"],
+                ascending=[True, True, False],
+            )
+            .drop_duplicates("日期", keep="first")
+            .tail(limit)
+            .reset_index(drop=True)
+        )
+        frame.attrs["source"] = "本地资金流仓库"
+        return frame
+
+    def upsert_chips(
+        self,
+        security: Security,
+        frame: pd.DataFrame,
+        *,
+        source: str,
+        is_estimated: bool = False,
+    ) -> int:
+        if frame is None or frame.empty:
+            return 0
+        security_id = self.upsert_security(security, source)
+        now = self._now()
+        rows: list[tuple[object, ...]] = []
+        for _, row in frame.iterrows():
+            parsed_date = pd.to_datetime(row.get("日期"), errors="coerce")
+            if pd.isna(parsed_date):
+                continue
+            rows.append(
+                (
+                    security_id,
+                    pd.Timestamp(parsed_date).strftime("%Y-%m-%d"),
+                    self._number(row.get("获利比例")),
+                    self._number(row.get("平均成本")),
+                    self._number(row.get("90成本-低")),
+                    self._number(row.get("90成本-高")),
+                    self._number(row.get("90集中度")),
+                    self._number(row.get("70成本-低")),
+                    self._number(row.get("70成本-高")),
+                    self._number(row.get("70集中度")),
+                    source,
+                    int(is_estimated),
+                    now,
+                )
+            )
+        with self.connect() as db:
+            db.executemany(
+                """INSERT INTO chip_daily
+                (security_id,trade_date,profit_ratio,average_cost,cost90_low,cost90_high,
+                 concentration90,cost70_low,cost70_high,concentration70,source,
+                 is_estimated,fetched_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(security_id,trade_date,source) DO UPDATE SET
+                profit_ratio=excluded.profit_ratio,average_cost=excluded.average_cost,
+                cost90_low=excluded.cost90_low,cost90_high=excluded.cost90_high,
+                concentration90=excluded.concentration90,cost70_low=excluded.cost70_low,
+                cost70_high=excluded.cost70_high,concentration70=excluded.concentration70,
+                is_estimated=excluded.is_estimated,fetched_at=excluded.fetched_at""",
+                rows,
+            )
+        return len(rows)
+
+    def get_chips(self, security: Security, limit: int = 160) -> pd.DataFrame:
+        security_id = self.security_id(security)
+        if security_id is None:
+            return pd.DataFrame()
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT trade_date AS 日期,profit_ratio AS 获利比例,
+                average_cost AS 平均成本,cost90_low AS "90成本-低",
+                cost90_high AS "90成本-高",concentration90 AS "90集中度",
+                cost70_low AS "70成本-低",cost70_high AS "70成本-高",
+                concentration70 AS "70集中度",source,is_estimated,fetched_at
+                FROM chip_daily WHERE security_id=?
+                ORDER BY trade_date DESC,is_estimated ASC,fetched_at DESC LIMIT ?""",
+                (security_id, max(1, min(limit * 3, 5000))),
+            ).fetchall()
+        frame = pd.DataFrame([dict(row) for row in rows])
+        if frame.empty:
+            return frame
+        frame = (
+            frame.sort_values(
+                ["日期", "is_estimated", "fetched_at"],
+                ascending=[True, True, False],
+            )
+            .drop_duplicates("日期", keep="first")
+            .tail(limit)
+            .reset_index(drop=True)
+        )
+        frame.attrs["source"] = "本地筹码仓库"
+        return frame
+
+    def save_dataset_snapshot(
+        self,
+        security: Security,
+        dataset_kind: str,
+        frame: pd.DataFrame,
+        *,
+        source: str = "",
+        as_of_date: date | str | None = None,
+    ) -> None:
+        if frame is None:
+            return
+        security_id = self.upsert_security(security, source)
+        payload = frame.to_json(
+            orient="split", date_format="iso", force_ascii=False, default_handler=str
+        )
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO security_dataset_snapshots
+                (security_id,dataset_kind,as_of_date,payload_json,source,fetched_at,record_count)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(security_id,dataset_kind) DO UPDATE SET
+                as_of_date=excluded.as_of_date,payload_json=excluded.payload_json,
+                source=excluded.source,fetched_at=excluded.fetched_at,
+                record_count=excluded.record_count""",
+                (
+                    security_id,
+                    dataset_kind,
+                    str(as_of_date or ""),
+                    payload,
+                    source,
+                    self._now(),
+                    len(frame),
+                ),
+            )
+
+    def load_dataset_snapshot(
+        self, security: Security, dataset_kind: str
+    ) -> tuple[pd.DataFrame, dict[str, object]]:
+        security_id = self.security_id(security)
+        if security_id is None:
+            return pd.DataFrame(), {}
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT payload_json,source,fetched_at,as_of_date,record_count
+                FROM security_dataset_snapshots
+                WHERE security_id=? AND dataset_kind=?""",
+                (security_id, dataset_kind),
+            ).fetchone()
+        if row is None:
+            return pd.DataFrame(), {}
+        try:
+            frame = pd.read_json(StringIO(str(row["payload_json"])), orient="split")
+        except (TypeError, ValueError):
+            return pd.DataFrame(), {}
+        metadata = {
+            "source": str(row["source"] or ""),
+            "fetched_at": str(row["fetched_at"] or ""),
+            "as_of_date": str(row["as_of_date"] or ""),
+            "record_count": int(row["record_count"] or 0),
+        }
+        frame.attrs.update(metadata)
+        return frame, metadata
+
+    def fetch_state(
+        self, security: Security, data_kind: str, data_key: str = ""
+    ) -> dict[str, object]:
+        security_id = self.security_id(security)
+        if security_id is None:
+            return {}
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT * FROM data_fetch_state
+                WHERE security_id=? AND data_kind=? AND data_key=?""",
+                (security_id, data_kind, data_key),
+            ).fetchone()
+        return dict(row) if row else {}
+
+    def update_fetch_state(
+        self,
+        security: Security,
+        data_kind: str,
+        data_key: str = "",
+        *,
+        success: bool,
+        coverage_start: str = "",
+        coverage_end: str = "",
+        record_count: int = 0,
+        source: str = "",
+        error: str = "",
+        retry_after: str = "",
+    ) -> None:
+        security_id = self.upsert_security(security, source)
+        now = self._now()
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO data_fetch_state
+                (security_id,data_kind,data_key,coverage_start,coverage_end,last_attempt_at,
+                 last_success_at,retry_after,last_error,record_count,source)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(security_id,data_kind,data_key) DO UPDATE SET
+                coverage_start=CASE WHEN excluded.coverage_start='' THEN data_fetch_state.coverage_start ELSE excluded.coverage_start END,
+                coverage_end=CASE WHEN excluded.coverage_end='' THEN data_fetch_state.coverage_end ELSE excluded.coverage_end END,
+                last_attempt_at=excluded.last_attempt_at,
+                last_success_at=CASE WHEN excluded.last_success_at='' THEN data_fetch_state.last_success_at ELSE excluded.last_success_at END,
+                retry_after=excluded.retry_after,last_error=excluded.last_error,
+                record_count=CASE WHEN excluded.record_count=0 THEN data_fetch_state.record_count ELSE excluded.record_count END,
+                source=CASE WHEN excluded.source='' THEN data_fetch_state.source ELSE excluded.source END""",
+                (
+                    security_id,
+                    data_kind,
+                    data_key,
+                    coverage_start,
+                    coverage_end,
+                    now,
+                    now if success else "",
+                    retry_after,
+                    "" if success else error[:2000],
+                    int(record_count),
+                    source,
+                ),
+            )
+
+    def save_market_breadth(
+        self, trade_date: date | str, values: dict[str, object]
+    ) -> None:
+        with self.connect() as db:
+            previous = db.execute(
+                """SELECT amount FROM market_breadth_daily
+                WHERE trade_date<? ORDER BY trade_date DESC LIMIT 1""",
+                (str(trade_date),),
+            ).fetchone()
+            amount = self._number(values.get("amount"))
+            amount_change = (
+                amount - float(previous[0])
+                if amount is not None and previous and previous[0] is not None
+                else None
+            )
+            db.execute(
+                """INSERT INTO market_breadth_daily
+                (trade_date,up_count,down_count,flat_count,limit_up_count,
+                 limit_down_count,broken_limit_count,max_limit_streak,amount,
+                 amount_change,median_return,equal_weight_return,market_volatility,
+                 chengjian_market_score,source,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(trade_date) DO UPDATE SET
+                up_count=excluded.up_count,down_count=excluded.down_count,
+                flat_count=excluded.flat_count,limit_up_count=excluded.limit_up_count,
+                limit_down_count=excluded.limit_down_count,
+                broken_limit_count=excluded.broken_limit_count,
+                max_limit_streak=excluded.max_limit_streak,amount=excluded.amount,
+                amount_change=excluded.amount_change,median_return=excluded.median_return,
+                equal_weight_return=excluded.equal_weight_return,
+                market_volatility=excluded.market_volatility,
+                chengjian_market_score=excluded.chengjian_market_score,
+                source=excluded.source,updated_at=excluded.updated_at""",
+                (
+                    str(trade_date),
+                    int(values.get("up", 0) or 0),
+                    int(values.get("down", 0) or 0),
+                    int(values.get("flat", 0) or 0),
+                    int(values.get("limit_up", 0) or 0),
+                    int(values.get("limit_down", 0) or 0),
+                    int(values.get("broken_limit", 0) or 0),
+                    int(values.get("max_limit_streak", 0) or 0),
+                    amount,
+                    amount_change,
+                    self._number(values.get("median_change")),
+                    self._number(
+                        values.get(
+                            "equal_weight_return", values.get("median_change")
+                        )
+                    ),
+                    self._number(values.get("market_volatility")),
+                    self._number(values.get("market_score")),
+                    str(values.get("source", "")),
+                    self._now(),
+                ),
+            )
+
+    def inventory(self) -> dict[str, object]:
+        tables = {
+            "daily_bars": "daily_bars",
+            "intraday_bars": "intraday_bars",
+            "daily_scores": "security_daily_scores",
+            "fund_flow": "fund_flow_daily",
+            "chips": "chip_daily",
+            "datasets": "security_dataset_snapshots",
+            "market_breadth": "market_breadth_daily",
+            "company_events": "company_events",
+        }
+        result: dict[str, object] = {}
+        with self.connect() as db:
+            for key, table in tables.items():
+                result[key] = int(
+                    db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                )
+            result["stock_daily_ready"] = int(
+                db.execute(
+                    """SELECT COUNT(DISTINCT security_id) FROM daily_bars
+                    WHERE adjustment='qfq' AND security_id IN
+                    (SELECT id FROM securities WHERE security_type='stock')"""
+                ).fetchone()[0]
+            )
+            result["intraday_securities"] = int(
+                db.execute(
+                    "SELECT COUNT(DISTINCT security_id) FROM intraday_bars"
+                ).fetchone()[0]
+            )
+        result["database_bytes"] = (
+            self.database_path.stat().st_size if self.database_path.exists() else 0
+        )
+        return result
+
+    def clear_rebuildable_data(self, category: str, before_date: str) -> int:
+        """Delete only explicitly re-downloadable data; protected tables are unreachable."""
+
+        statements = {
+            "intraday": ("intraday_bars", "trade_date"),
+            "scores": ("security_daily_scores", "trade_date"),
+            "fund_flow": ("fund_flow_daily", "trade_date"),
+            "chips": ("chip_daily", "trade_date"),
+            "market_breadth": ("market_breadth_daily", "trade_date"),
+        }
+        if category not in statements:
+            raise ValueError("该数据属于受保护信息，不能通过存储管理删除")
+        table, column = statements[category]
+        with self.connect() as db:
+            cursor = db.execute(
+                f"DELETE FROM {table} WHERE {column}<?", (before_date,)
+            )
+            return max(int(cursor.rowcount), 0)
+
+    def clear_task_history(self) -> int:
+        with self.connect() as db:
+            count = int(db.execute("SELECT COUNT(*) FROM sync_jobs").fetchone()[0])
+            db.execute("DELETE FROM sync_jobs")
+            db.execute("DELETE FROM data_quality_issues WHERE resolved=1")
+        return count
+
+    def optimize(self) -> None:
+        with self.connect() as db:
+            db.execute("PRAGMA optimize")
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection = sqlite3.connect(self.database_path, timeout=30)
+        try:
+            connection.execute("VACUUM")
+        finally:
+            connection.close()

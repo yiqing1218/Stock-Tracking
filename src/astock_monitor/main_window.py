@@ -29,7 +29,9 @@ from .models import Security
 from .repository import Repository
 from .screening_page import ScreeningPage
 from .strategy_page import StrategyBacktestPage
+from .time_utils import recent_completed_market_days
 from .watchlist_page import WatchlistPage
+from .ui_common import Worker
 
 
 class MainWindow(QMainWindow):
@@ -89,6 +91,8 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.historical_store = HistoricalStore(repository.database_path)
+        self.provider.attach_store(self.historical_store)
+        self._startup_prefetch_worker: Worker | None = None
         self.market_page = MarketDashboardPage(
             provider, self.thread_pool, repository=repository, store=self.historical_store
         )
@@ -139,6 +143,55 @@ class MainWindow(QMainWindow):
     def start(self) -> None:
         self.show_page("market")
         self.alerts_page.start()
+        self._start_recent_intraday_prefetch()
+
+    def _start_recent_intraday_prefetch(self) -> None:
+        if self._startup_prefetch_worker is not None:
+            return
+        securities = self.repository.list_watchlist()
+        if not securities:
+            self.data_page.set_startup_prefetch_status("自选列表为空，未执行近5日分时下载。")
+            return
+        self.data_page.set_startup_prefetch_status(
+            f"后台准备 {len(securities)} 只自选证券最近5个可用交易日的一分钟分时…"
+        )
+        worker = Worker(self._prefetch_recent_intraday, securities)
+        self._startup_prefetch_worker = worker
+        worker.signals.result.connect(
+            lambda value: self.data_page.set_startup_prefetch_status(str(value))
+        )
+        worker.signals.error.connect(
+            lambda message: self.data_page.set_startup_prefetch_status(
+                f"近5日分时后台下载未完成：{message}"
+            )
+        )
+        worker.signals.finished.connect(
+            lambda: setattr(self, "_startup_prefetch_worker", None)
+        )
+        self.thread_pool.start(worker)
+
+    def _prefetch_recent_intraday(self, securities: list[Security]) -> str:
+        candidates = recent_completed_market_days(9)
+        completed = failed = 0
+        for security in securities:
+            success_days = 0
+            for trading_day in candidates:
+                if success_days >= 5:
+                    break
+                try:
+                    frame, _source = self.provider.get_intraday(
+                        security, trading_day, "1"
+                    )
+                    if frame.empty:
+                        continue
+                    success_days += 1
+                    completed += 1
+                except Exception:
+                    failed += 1
+        return (
+            f"近5日分时后台下载完成：新增或复用 {completed} 个证券交易日"
+            + (f"，不可用日期 {failed} 次。" if failed else "。")
+        )
 
     def open_detail(self, security: Security) -> None:
         if not self.repository.contains_security(security):

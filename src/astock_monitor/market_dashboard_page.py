@@ -284,35 +284,41 @@ class MarketDashboardPage(QWidget):
         return page
 
     def _refresh_board_explorers(self) -> None:
-        if self.market_analysis is None:
-            return
         self._reload_relative_targets()
         for board_type, (table, history, status) in self.board_explorers.items():
-            rows = self.market_analysis.list_boards(board_type)
+            frame = self._boards
+            if not frame.empty and "类型" in frame:
+                frame = frame[frame["类型"] == board_type].copy()
+            if self.market_analysis is not None and not frame.empty:
+                frame["_heat"] = self.market_analysis._board_heat(frame)
             table.setSortingEnabled(False)
-            table.setRowCount(len(rows))
-            for row_index, row in enumerate(rows):
+            table.setRowCount(len(frame))
+            for row_index, (_, row) in enumerate(frame.iterrows()):
                 numeric_values = (
                     None,
-                    self._number(row["change_pct"]),
-                    self._number(row["chengjian_heat"]),
-                    self._number(row["up_count"]),
-                    self._number(row["down_count"]),
-                    self._number(row["amount"]),
-                    self._number(row["fund_flow"]),
+                    self._number(row.get("涨跌幅")),
+                    self._number(row.get("_heat")),
+                    self._number(row.get("上涨家数")),
+                    self._number(row.get("下跌家数")),
+                    self._number(row.get("成交额", row.get("总成交额"))),
+                    self._number(row.get("主力净流入", row.get("资金净流入"))),
                     None,
                     None,
                 )
                 values = (
-                    row["board_name"],
-                    format_percent(self._number(row["change_pct"])),
-                    format_number(self._number(row["chengjian_heat"]), decimals=1),
-                    format_number(self._number(row["up_count"]), decimals=0),
-                    format_number(self._number(row["down_count"]), decimals=0),
-                    format_number(self._number(row["amount"])),
-                    format_number(self._number(row["fund_flow"])),
-                    row["classification_source"],
-                    row["first_date"] or "—",
+                    str(row.get("板块名称", "—")),
+                    format_percent(self._number(row.get("涨跌幅"))),
+                    format_number(self._number(row.get("_heat")), decimals=1),
+                    format_number(self._number(row.get("上涨家数")), decimals=0),
+                    format_number(self._number(row.get("下跌家数")), decimals=0),
+                    format_number(
+                        self._number(row.get("成交额", row.get("总成交额")))
+                    ),
+                    format_number(
+                        self._number(row.get("主力净流入", row.get("资金净流入")))
+                    ),
+                    str(row.get("分类来源", self._boards.attrs.get("source", "公开板块接口"))),
+                    "不保存",
                 )
                 for column, value in enumerate(values):
                     numeric = numeric_values[column]
@@ -321,12 +327,14 @@ class MarketDashboardPage(QWidget):
                         if numeric is not None
                         else QTableWidgetItem(str(value))
                     )
-                    item.setData(Qt.ItemDataRole.UserRole, int(row["id"]))
+                    item.setData(Qt.ItemDataRole.UserRole, str(row.get("板块名称", "")))
                     table.setItem(row_index, column, item)
             table.setSortingEnabled(True)
             table.sortItems(1, Qt.SortOrder.DescendingOrder)
             history.setRowCount(0)
-            status.setText(f"本地已保存 {len(rows)} 个{board_type}板块的最新快照。")
+            status.setText(
+                f"当前交易日共 {len(frame)} 个{board_type}板块；实时列表仅展示，不写入本地数据库。"
+            )
 
     def _reload_relative_targets(self) -> None:
         if self.repository is None:
@@ -358,16 +366,10 @@ class MarketDashboardPage(QWidget):
             result_label.setText("自选列表中没有可计算证券。")
             return
         if benchmark_combo.currentData() == "board":
-            table = self.board_explorers[board_type][0]
-            row = table.currentRow()
-            item = table.item(row, 0) if row >= 0 else None
-            if item is None:
-                result_label.setText(f"请先选择一个{board_type}板块。")
-                return
-            values = self.market_analysis.relative_strength_to_board(
-                security, int(item.data(Qt.ItemDataRole.UserRole))
+            result_label.setText(
+                "当前板块列表按要求不保存历史，无法计算板块历史相对强弱；请选择沪深300。"
             )
-            benchmark_name = item.text()
+            return
         else:
             benchmark = Security("000300", "沪深300", SecurityType.INDEX, "csi")
             values = self.market_analysis.relative_strength(security, benchmark)
@@ -379,57 +381,31 @@ class MarketDashboardPage(QWidget):
         result_label.setText(f"相对{benchmark_name}：" + " · ".join(parts))
 
     def _show_board_history(self, board_type: str, row: int) -> None:
-        if self.market_analysis is None:
-            return
         table, history, status = self.board_explorers[board_type]
         item = table.item(row, 0)
         if item is None:
             return
-        frame = self.market_analysis.board_history(
-            int(item.data(Qt.ItemDataRole.UserRole))
+        history.setRowCount(0)
+        history.setColumnCount(1)
+        history.setHorizontalHeaderLabels(["说明"])
+        history.setRowCount(1)
+        history.setItem(
+            0,
+            0,
+            QTableWidgetItem("板块实时行情不落库；这里只保留当前交易日展示。"),
         )
-        history.setColumnCount(len(frame.columns))
-        history.setHorizontalHeaderLabels([str(column) for column in frame.columns])
-        history.setRowCount(len(frame))
-        for row_index, (_, values) in enumerate(frame.iterrows()):
-            for column, name in enumerate(frame.columns):
-                history.setItem(row_index, column, QTableWidgetItem(str(values[name])))
-        status.setText(f"{item.text()}：{len(frame)} 个本地交易日观测。")
+        status.setText(f"{item.text()}：当前交易日实时板块。")
 
     def _show_board_menu(self, board_type: str, position) -> None:  # type: ignore[no-untyped-def]
-        if self.market_analysis is None:
-            return
         table, _history, _status = self.board_explorers[board_type]
         row = table.rowAt(position.y())
         item = table.item(row, 0) if row >= 0 else None
         if item is None:
             return
         menu = QMenu(self)
-        sync = menu.addAction("同步并显示当前成分股")
-        selected = menu.exec(table.viewport().mapToGlobal(position))
-        if selected is not sync:
-            return
-        board_id = int(item.data(Qt.ItemDataRole.UserRole))
-        board_name = item.text()
-        worker = Worker(self._sync_board_members, board_id)
-        self._active_workers.add(worker)
-        worker.signals.result.connect(
-            lambda value, kind=board_type, name=board_name: self._show_board_members(
-                kind, name, value
-            )
-        )
-        worker.signals.error.connect(
-            lambda message, kind=board_type: self.board_explorers[kind][2].setText(
-                f"成分同步失败：{message}"
-            )
-        )
-        worker.signals.finished.connect(
-            lambda current=worker: self._active_workers.discard(current)
-        )
-        self.board_explorers[board_type][2].setText(
-            f"正在同步 {board_name} 当前成分；不会覆盖历史成员区间…"
-        )
-        self.thread_pool.start(worker)
+        note = menu.addAction("当前板块仅展示，不保存成分与历史")
+        note.setEnabled(False)
+        menu.exec(table.viewport().mapToGlobal(position))
 
     def _sync_board_members(self, board_id: int) -> tuple[int, list[dict]]:
         if self.market_analysis is None:

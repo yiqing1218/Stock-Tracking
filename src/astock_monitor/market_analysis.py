@@ -86,61 +86,10 @@ class MarketAnalysisService:
 
     def persist_dashboard(self, bundle: MarketDashboardBundle) -> None:
         trade_date = bundle.trade_date or beijing_today()
-        timestamp = beijing_now().strftime("%Y-%m-%d %H:%M:%S%z")
-        breadth = bundle.breadth
-        source = bundle.sources.get("breadth", "")
-        with self.store.connect() as db:
-            previous = db.execute(
-                "SELECT amount FROM market_snapshots WHERE trade_date<? ORDER BY trade_date DESC,snapshot_time DESC LIMIT 1",
-                (trade_date.isoformat(),),
-            ).fetchone()
-            amount = float(breadth.get("amount", 0))
-            amount_change = (
-                amount - float(previous[0]) if previous and previous[0] else None
-            )
-            equal_weight = (
-                float(breadth.get("median_change", 0))
-                if "equal_weight_return" not in breadth
-                else float(breadth["equal_weight_return"])
-            )
-            db.execute(
-                """INSERT INTO market_snapshots
-                (trade_date,snapshot_time,up_count,down_count,flat_count,limit_up_count,
-                limit_down_count,broken_limit_count,max_limit_streak,amount,amount_change,
-                median_return,equal_weight_return,market_volatility,chengjian_market_score,source)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(trade_date,snapshot_time) DO UPDATE SET
-                up_count=excluded.up_count,down_count=excluded.down_count,
-                flat_count=excluded.flat_count,limit_up_count=excluded.limit_up_count,
-                limit_down_count=excluded.limit_down_count,amount=excluded.amount,
-                amount_change=excluded.amount_change,median_return=excluded.median_return,
-                equal_weight_return=excluded.equal_weight_return,
-                chengjian_market_score=excluded.chengjian_market_score,source=excluded.source""",
-                (
-                    trade_date.isoformat(),
-                    timestamp,
-                    int(breadth.get("up", 0)),
-                    int(breadth.get("down", 0)),
-                    int(breadth.get("flat", 0)),
-                    int(breadth.get("limit_up", 0)),
-                    int(breadth.get("limit_down", 0)),
-                    int(breadth.get("broken_limit", 0)),
-                    int(breadth.get("max_limit_streak", 0)),
-                    amount,
-                    amount_change,
-                    float(breadth.get("median_change", 0)),
-                    equal_weight,
-                    float(breadth.get("market_volatility", 0)),
-                    self.market_score(breadth),
-                    source,
-                ),
-            )
-        self.persist_boards(
-            bundle.boards,
-            trade_date.isoformat(),
-            timestamp,
-            bundle.sources.get("boards", ""),
-        )
+        breadth = dict(bundle.breadth)
+        breadth["market_score"] = self.market_score(breadth)
+        breadth["source"] = bundle.sources.get("breadth", "")
+        self.store.save_market_breadth(trade_date, breadth)
 
     def persist_boards(
         self, frame: pd.DataFrame, trade_date: str, timestamp: str, source: str
